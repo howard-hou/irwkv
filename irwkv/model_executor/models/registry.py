@@ -52,7 +52,10 @@ from .interfaces_base import (
 logger = init_logger(__name__)
 
 
-_IRWKV_MODELS = {"RwkvForCausalLM": ("rwkv", "RwkvForCausalLM")}
+_IRWKV_MODELS = {
+    "RwkvForCausalLM": ("rwkv", "RwkvForCausalLM"),
+    "Rwkv7HybridForCausalLM": ("rwkv7_hybrid", "Rwkv7HybridForCausalLM"),
+}
 
 # This variable is used as the args for subprocess.run(). We
 # can modify  this variable to alter the args if needed. e.g.

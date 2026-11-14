@@ -51,6 +51,8 @@ class ModelArchConfigConvertorBase:
         return self.hf_text_config.head_size
 
     def get_total_num_kv_heads(self) -> int:
+        if self.hf_text_config.model_type == "rwkv7_hybrid":
+            return self.hf_text_config.num_key_value_heads
         return 0
 
     @final

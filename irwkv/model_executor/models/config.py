@@ -202,6 +202,66 @@ class RwkvForCausalLMConfig(VerifyAndUpdateConfig):
                 compilation_config.cudagraph_capture_sizes = capture_sizes
 
 
+class Rwkv7HybridForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(irwkv_config: "IrwkvConfig") -> None:
+        import torch
+
+        from irwkv.config.compilation import CompilationMode, CUDAGraphMode
+
+        model = irwkv_config.model_config
+        parallel = irwkv_config.parallel_config
+        cache = irwkv_config.cache_config
+        if model.dtype != torch.bfloat16:
+            raise ValueError("The bux hybrid serving adapter requires bfloat16")
+        if any(
+            value != 1
+            for value in (
+                parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.decode_context_parallel_size,
+                parallel.prefill_context_parallel_size,
+            )
+        ):
+            raise ValueError("The bux hybrid currently supports TP=PP=DCP=PCP=1")
+        if getattr(
+            model.hf_config, "quantization_config", None
+        ) is not None or cache.cache_dtype not in (
+            "auto",
+            "bfloat16",
+        ):
+            raise ValueError(
+                "The bux hybrid currently supports BF16 weights and KV cache"
+            )
+        if (
+            irwkv_config.kv_transfer_config is not None
+            or cache.kv_offloading_size is not None
+        ):
+            raise ValueError(
+                "The bux hybrid does not support cache transfer or offloading"
+            )
+        if cache.mamba_cache_mode == "all":
+            raise ValueError(
+                "The bux hybrid supports recurrent cache modes none and align"
+            )
+        if cache.mamba_ssm_cache_dtype not in ("auto", "float32"):
+            raise ValueError(
+                "The FlashRWKV2 hybrid adapter requires FP32 recurrent state"
+            )
+        if cache.mamba_cache_dtype not in ("auto", "bfloat16"):
+            raise ValueError("The hybrid token-shift cache requires bfloat16")
+        if not irwkv_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError("The bux hybrid requires chunked prefill")
+        cache.mamba_ssm_cache_dtype = "float32"
+        cache.mamba_cache_dtype = "bfloat16"
+        MambaModelConfig.verify_and_update_config(irwkv_config)
+        model.enforce_eager = True
+        irwkv_config.compilation_config.mode = CompilationMode.NONE
+        irwkv_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        logger.info("bux hybrid uses eager SDPA and FlashRWKV2 with FP32 state")
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "RwkvForCausalLM": RwkvForCausalLMConfig,
+    "Rwkv7HybridForCausalLM": Rwkv7HybridForCausalLMConfig,
 }
