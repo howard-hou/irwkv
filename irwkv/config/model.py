@@ -1177,6 +1177,9 @@ class ModelConfig:
         parallel_config: ParallelConfig,
         block_type: LayerBlockType = "attention",
     ) -> int:
+        if self.hf_text_config.model_type == "rwkv7_hybrid":
+            start, end = self.get_layers_start_end_indices(parallel_config)
+            return self.hf_text_config.layers_block_type[start:end].count(block_type)
         return 0 if block_type == "attention" else self.get_num_layers(parallel_config)
 
     def get_mamba_chunk_size(self) -> int:

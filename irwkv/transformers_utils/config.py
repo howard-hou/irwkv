@@ -40,6 +40,10 @@ if envs.IRWKV_USE_MODELSCOPE:
 else:
     from transformers import AutoConfig
 
+from irwkv.transformers_utils.rwkv7_hybrid import Rwkv7HybridConfig
+
+AutoConfig.register("rwkv7_hybrid", Rwkv7HybridConfig)
+
 logger = init_logger(__name__)
 
 _ST_POOLING_MODULE_TYPES = {
