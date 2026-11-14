@@ -250,15 +250,43 @@ class Rwkv7HybridForCausalLMConfig(VerifyAndUpdateConfig):
             )
         if cache.mamba_cache_dtype not in ("auto", "bfloat16"):
             raise ValueError("The hybrid token-shift cache requires bfloat16")
+        if cache.block_size % 16:
+            raise ValueError("Hybrid paged FA2 requires block_size divisible by 16")
         if not irwkv_config.scheduler_config.enable_chunked_prefill:
             raise ValueError("The bux hybrid requires chunked prefill")
         cache.mamba_ssm_cache_dtype = "float32"
         cache.mamba_cache_dtype = "bfloat16"
         MambaModelConfig.verify_and_update_config(irwkv_config)
-        model.enforce_eager = True
-        irwkv_config.compilation_config.mode = CompilationMode.NONE
-        irwkv_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        logger.info("bux hybrid uses eager SDPA and FlashRWKV2 with FP32 state")
+        compilation_config = irwkv_config.compilation_config
+        if compilation_config.mode is None:
+            compilation_config.mode = CompilationMode.NONE
+        if compilation_config.cudagraph_mode is None:
+            compilation_config.cudagraph_mode = (
+                CUDAGraphMode.NONE if model.enforce_eager else CUDAGraphMode.FULL
+            )
+        if not model.enforce_eager:
+            max_tokens = irwkv_config.scheduler_config.max_num_batched_tokens
+            if compilation_config.cudagraph_capture_sizes is None:
+                if compilation_config.max_cudagraph_capture_size is None:
+                    compilation_config.max_cudagraph_capture_size = max_tokens
+                max_capture = min(
+                    compilation_config.max_cudagraph_capture_size,
+                    max_tokens,
+                )
+                capture_sizes = [1, 2, 4]
+                capture_sizes.extend(range(8, min(max_capture + 1, 256), 8))
+                if max_capture >= 256:
+                    capture_sizes.extend(range(256, min(max_capture + 1, 1024), 16))
+                if max_capture >= 1024:
+                    capture_sizes.extend(range(1024, max_capture + 1, 1024))
+                if max_capture not in capture_sizes:
+                    capture_sizes.append(max_capture)
+                compilation_config.cudagraph_capture_sizes = capture_sizes
+        logger.info(
+            "bux hybrid uses paged FA2 and FlashRWKV2 with FP32 state; "
+            "CUDA graph mode: %s",
+            compilation_config.cudagraph_mode,
+        )
 
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {

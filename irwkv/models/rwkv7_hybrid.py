@@ -7,11 +7,25 @@ Cache ownership and recurrence dispatch belong to the serving adapter.
 
 import math
 from collections.abc import Callable
+from functools import cache
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.attention.bias import causal_lower_right
+
+
+@cache
+def _load_paged_fa2():
+    try:
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            flash_attn_varlen_func,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "CUDA hybrid attention requires vllm 0.32.0's paged FA2 binary"
+        ) from error
+    return flash_attn_varlen_func
 
 
 class Rwkv7HybridLayerNorm(nn.LayerNorm):
@@ -172,6 +186,24 @@ class Rwkv7HybridCacheStorage:
     def copy_state_slots(self, sources, destinations):
         self.kv_cache[destinations] = self.kv_cache[sources]
 
+    def prepare_recurrent_metadata(self, metadata, flash, *, retain_ticket=False):
+        indices = metadata.state_indices
+        slots = torch.arange(len(indices), dtype=torch.int32, device=indices.device)
+        max_length = max(b - a for a, b in zip(metadata.starts, metadata.starts[1:]))
+        ticket = flash.prepare_tmix_wkv7_recurrent_metadata(
+            metadata.cu_seqlens,
+            slots,
+            state_pool_size=len(indices),
+            total_tokens=getattr(metadata, "token_capacity", metadata.starts[-1]),
+            max_seqlen=max_length,
+        )
+        metadata.recurrent_slots = slots
+        metadata.max_recurrent_seq_len = max_length
+        metadata.validated_metadata = ticket
+        if retain_ticket:
+            self._live_graph_tickets.append(ticket)
+        return ticket
+
     def run_recurrent(self, mixer, x, metadata, flash):
         indices = metadata.state_indices
         previous_pool, state_pool = self.state_views()
@@ -182,15 +214,11 @@ class Rwkv7HybridCacheStorage:
         # remains authoritative, including copy-on-write and prefix snapshots.
         state = state_pool.index_select(0, indices).contiguous()
         handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
-        slots = torch.arange(len(indices), dtype=torch.int32, device=x.device)
-        max_length = max(b - a for a, b in zip(metadata.starts, metadata.starts[1:]))
-        ticket = flash.prepare_tmix_wkv7_recurrent_metadata(
-            metadata.cu_seqlens,
-            slots,
-            state_pool_size=len(indices),
-            total_tokens=x.shape[0],
-            max_seqlen=max_length,
-        )
+        if getattr(metadata, "validated_metadata", None) is None:
+            self.prepare_recurrent_metadata(metadata, flash)
+        slots = metadata.recurrent_slots
+        max_length = metadata.max_recurrent_seq_len
+        ticket = metadata.validated_metadata
 
         def recur(r, decay, k, v, a, b):
             return flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
@@ -214,6 +242,26 @@ class Rwkv7HybridCacheStorage:
         blocks, offsets = slots // block_size, slots % block_size
         cache[blocks, :, offsets, :64] = k
         cache[blocks, :, offsets, 64:] = v
+        if q.is_cuda:
+            paged = cache.transpose(1, 2)
+            key_cache, value_cache = paged.split(64, dim=-1)
+            output = torch.empty_like(q)
+            _load_paged_fa2()(
+                q,
+                key_cache,
+                value_cache,
+                max_seqlen_q=metadata.max_query_len,
+                cu_seqlens_q=metadata.cu_seqlens,
+                max_seqlen_k=metadata.max_seq_len,
+                seqused_k=metadata.seq_lens,
+                block_table=metadata.block_table,
+                causal=True,
+                softmax_scale=64**-0.5,
+                fa_version=2,
+                out=output,
+            )
+            return output
+
         output = torch.empty_like(q)
         for row, (start, end, length) in enumerate(
             zip(metadata.starts, metadata.starts[1:], metadata.lengths)

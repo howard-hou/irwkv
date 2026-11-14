@@ -25,6 +25,7 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
         self.prefix = prefix
         self.recurrent = recurrent
         self.num_heads = irwkv_config.model_config.hf_config.num_attention_heads
+        self._live_graph_tickets = []
         self.register_buffer("kv_cache", torch.empty(0), persistent=False)
         context = irwkv_config.compilation_config.static_forward_context
         if prefix in context:
@@ -36,6 +37,11 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
             Rwkv7HybridRecurrentBackend
             if self.recurrent
             else Rwkv7HybridAttentionBackend
+        )
+
+    def prepare_metadata_ticket(self, metadata, *, retain_ticket=False):
+        return self.prepare_recurrent_metadata(
+            metadata, _load_flashrwkv2(), retain_ticket=retain_ticket
         )
 
     def get_kv_cache_spec(self, irwkv_config):

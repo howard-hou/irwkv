@@ -228,7 +228,10 @@ def test_engine_config_preserves_hybrid_geometry_and_cache_mode(tmp_path):
     assert model.get_num_layers_by_block_type(parallel, "attention") == 1
     assert model.get_num_layers_by_block_type(parallel, "mamba") == 3
     assert model.get_num_kv_heads(parallel) == 1
-    assert model.enforce_eager
+    assert not model.enforce_eager
+    assert config.compilation_config.mode.name == "NONE"
+    assert config.compilation_config.cudagraph_mode.name == "FULL"
+    assert config.compilation_config.cudagraph_capture_sizes[-1] == 128
     assert cache.mamba_cache_mode == "align"
     assert cache.mamba_ssm_cache_dtype == "float32"
 
@@ -259,11 +262,11 @@ def test_full_hybrid_flash_recurrence_and_paged_attention(batch_size):
             )
         else:
             cache.kv_cache = torch.zeros(
-                12, 1, 4, 128, dtype=torch.bfloat16, device="cuda"
+                12, 1, 16, 128, dtype=torch.bfloat16, device="cuda"
             )
         caches.append(cache)
     pages = torch.tensor(
-        [[3, 1, 4, 2, 5], [8, 6, 9, 7, 10]][:batch_size], device="cuda"
+        [[3, 1], [8, 6]][:batch_size], dtype=torch.int32, device="cuda"
     )
     outputs = [[] for _ in bounds]
     for step in range(4):
@@ -278,10 +281,15 @@ def test_full_hybrid_flash_recurrence_and_paged_attention(batch_size):
             starts=tuple(starts),
             lengths=tuple(row[step + 1] for row in bounds),
             cu_seqlens=torch.tensor(starts, dtype=torch.int32, device="cuda"),
+            seq_lens=torch.tensor(
+                [row[step + 1] for row in bounds], dtype=torch.int32, device="cuda"
+            ),
+            max_query_len=max(len(row) for row in ranges),
+            max_seq_len=max(row[step + 1] for row in bounds),
             state_indices=torch.tensor([2, 4][:batch_size], device="cuda"),
             block_table=pages,
             slot_mapping=torch.cat(
-                [pages[i, row // 4] * 4 + row % 4 for i, row in enumerate(ranges)]
+                [pages[i, row // 16] * 16 + row % 16 for i, row in enumerate(ranges)]
             ),
         )
 

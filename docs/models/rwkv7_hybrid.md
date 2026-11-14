@@ -1,8 +1,8 @@
 # bux RWKV-7 / RoPE Hybrid
 
 Experimental adapter for [pilot7747/bux](https://github.com/pilot7747/bux/tree/03d5031fcc842ae4a4992921356af31b1bceaee0).
-The complete FlashRWKV2 path and engine generation have been exercised on Colab
-A100. This eager implementation is not yet a matched performance baseline for bux.
+The complete FlashRWKV2 path, paged attention, full-decode CUDA Graphs and engine
+generation have been exercised on Colab A100. Inductor compilation remains disabled.
 
 ## Architecture
 
@@ -35,12 +35,20 @@ each batch. Prefix-boundary transitions copy recurrent state; generic block
 copies and resets cover both cache types.
 
 Supported scope: BF16 weights/KV, FP32 recurrent state, TP=PP=1, chunked prefill,
-recurrent cache modes none and align. Execution is eager. Attention uses PyTorch
-SDPA with page gathering and lower-right causal bias. Four-dimensional inputs
-allow fused attention dispatch without an explicitly materialized quadratic mask.
-Quantization, FP8 KV,
-distributed execution, cache transfer and offload are rejected.
-CPU metadata synchronization and state gathering introduce overhead.
+recurrent cache modes none and align. CUDA attention uses vLLM 0.32.0's paged FA2
+with lower-right causal bias and reads scheduler-owned pages directly, without
+materializing each request's complete KV history. The attention block size must be
+divisible by 16. CPU tensor tests retain a PyTorch SDPA reference path.
+Quantization, FP8 KV, distributed execution, cache transfer and offload are
+rejected. Recurrent-state gathering and eager prefill dispatch still introduce
+overhead.
+
+CUDA defaults to `CompilationMode.NONE` with full-decode CUDA Graphs. The engine
+reports this as `FULL_DECODE_ONLY`; prefill remains eager. Paged FA2 uses live GPU
+sequence lengths and block tables during replay. FlashRWKV2 metadata tickets and
+recurrent slot tensors are prepared outside capture, retained for graph reuse and
+shared by all recurrent layers in a batch. `enforce_eager=True` remains available
+for debugging. No Inductor or `torch.compile` result is claimed.
 
 Native irwkv parameter names are accepted. A bux checkpoint-name conversion is
 not supplied. Dummy weights support timing, not meaningful generated text or
@@ -134,24 +142,34 @@ Colab A100-SXM4-40GB, Python 3.12.3, PyTorch 2.13.0+cu132, system CUDA Toolkit
 - Independently loading original bux modules on local CPU: the FP32 full-model
   comparison passed; the BF16 discrepancy above remains a strict expected failure.
 
-The 3328 model also completed the author's original Agent workload, with
-concurrency 1 and the default two timed sessions (plus warmup):
+The 3328 model completed the author's original Agent workload with concurrency 1
+and the default two timed sessions plus warmup. All prompt, turn, output, tool,
+batch-token, context and precision defaults were unchanged. These are individual
+completed runs on the same A100 model, not a concurrency sweep:
 
-| Metric | A100 40GB, BF16 eager |
-| --- | --- |
-| Timed duration | 540.04 s |
-| Sessions/hour | 13.3 |
-| Output tokens/s | 7.6 |
-| Median TPOT | 129.18 ms |
-| p90 TPOT | 133.43 ms |
-| Median first-turn TTFT | 3.397 s |
-| Prefix cache hit | 72.09% |
+| Metric | irwkv eager KV gather | irwkv paged FA2 eager | irwkv FA2 full-decode graph | Author bux/vLLM |
+| --- | ---: | ---: | ---: | ---: |
+| Timed duration | 540.04 s | 490.21 s | 140.06 s | 104.64 s |
+| Sessions/hour | 13.3 | 14.7 | 51.4 | 68.8 |
+| Output tokens/s | 7.6 | 8.4 | 29.2 | 39.1 |
+| Median TPOT | 129.18 ms | 117.12 ms | 31.84 ms | 22.20 ms |
+| p90 TPOT | 133.43 ms | 117.81 ms | 32.52 ms | 22.86 ms |
+| Median first-turn TTFT | 3.397 s | 3.390 s | 3.242 s | 3.815 s |
+| Prefix cache hit | 72.09% | 72.09% | 72.09% | 70.02% |
 
-The command was the Agent benchmark above with `--concurrency 1` and tag
-`colab-a100-bf16-3328-author-workload`; all prompt, turn, output, tool, batch-token,
-context and precision defaults were unchanged. This is a single completed run,
-not a concurrency sweep or an A/B comparison. It exceeds the author's 30 ms TPOT
-SLO. The original-length workload was not run for widths 3584 and 3840.
+The graph run used `compilation_config={"max_cudagraph_capture_size":4}` and tag
+`colab-a100-bf16-3328-fa2-graph-author-workload`. It completed full-decode capture
+and replay with Inductor disabled. Median TPOT improved 4.06x over the original
+irwkv implementation and 3.68x over paged FA2 without graphs. It remains 1.43x
+the author's 22.20 ms and is just above the 30 ms SLO. The author run used vLLM
+0.32.0 with Inductor plus full/piecewise graphs; irwkv used its pinned fork,
+FlashRWKV2 and no Inductor, so this is a matched hardware/precision/workload A/B,
+not a claim of identical software or operator stacks. The original-length workload
+was not run for widths 3584 and 3840.
+
+A pre-optimization trace of 32 unique decode steps averaged 234.26 ms/token, with
+50.97 ms GPU-active and 183.29 ms GPU-idle time. These instrumented measurements
+located host/dispatch overhead and are not throughput baseline results.
 
 The engine configuration check exposed and fixed a reference to the removed
 ModelConfig.quantization field. SDPA now uses four-dimensional inputs and
@@ -163,5 +181,5 @@ these settings. FlashRWKV2 uses its untuned default configuration in these runs.
 Target BF16 weights alone take approximately 13.3 / 16.6 / 20.3 GiB, before caches
 and workspace. The 24 GiB card cannot support the author's high-concurrency target
 workload. Exhaustive preemption tests, trained checkpoint conversion/evaluation,
-and matched bux-versus-irwkv performance measurements remain outstanding.
+concurrency sweeps and Inductor/kernel-level parity work remain outstanding.
 
