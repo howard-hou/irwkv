@@ -228,3 +228,19 @@ target_compile_definitions(rwkv7_ops PRIVATE
   TORCH_TARGET_VERSION=0x020B000000000000ULL
   USE_CUDA
   IRWKV_RWKV_RUNTIME_OPS)
+
+set(RWKV7_ALBATROSS_CUDA_SRC "csrc/rwkv7/albatross_wkv.cu")
+set(RWKV7_ALBATROSS_SRC
+  ${RWKV7_ALBATROSS_CUDA_SRC}
+  "csrc/rwkv7/albatross_wkv.cpp")
+set_gencode_flags_for_srcs(
+  SRCS "${RWKV7_ALBATROSS_CUDA_SRC}"
+  CUDA_ARCHS "${CUDA_ARCHS}")
+define_extension_target(
+  rwkv7_albatross_ops
+  DESTINATION irwkv
+  LANGUAGE CUDA
+  SOURCES ${RWKV7_ALBATROSS_SRC}
+  COMPILE_FLAGS ${IRWKV_GPU_FLAGS}
+  ARCHITECTURES ${IRWKV_GPU_ARCHES}
+  WITH_SOABI)

@@ -73,6 +73,27 @@ def initialized_model(device="cpu", dtype=torch.float32):
     return model
 
 
+@torch.inference_mode()
+def test_fused_qkv_matches_separate_projection_and_shard_loading():
+    model = initialized_model()
+    mixer = model.layers[3].mixer
+    weight = mixer.qkv.weight.detach().clone()
+    bias = mixer.qkv.bias.detach().clone()
+    x = torch.randn(5, 64)
+    expected = [F.linear(x, w, b) for w, b in zip(weight.chunk(3), bias.chunk(3))]
+    torch.testing.assert_close(list(mixer.qkv(x).chunk(3, dim=-1)), expected)
+
+    mixer.qkv.weight.zero_()
+    mixer.qkv.bias.zero_()
+    for shard, (w, b) in enumerate(zip(weight.chunk(3), bias.chunk(3))):
+        for param, tensor in ((mixer.qkv.weight, w), (mixer.qkv.bias, b)):
+            tensor.shard_id = shard
+            param.weight_loader(param, tensor)
+    torch.testing.assert_close(mixer.qkv.weight, weight)
+    torch.testing.assert_close(mixer.qkv.bias, bias)
+    torch.testing.assert_close(list(mixer.qkv(x).chunk(3, dim=-1)), expected)
+
+
 def run_reference(model, tokens, state, offset):
     positions = torch.arange(offset, offset + len(tokens), device=tokens.device)
 
@@ -201,6 +222,68 @@ def test_recurrent_page_padding_copy_and_reset_preserve_other_slots():
     assert raw.view(5, page_bytes)[:, content_bytes:].count_nonzero() == 0
 
 
+def test_empty_recurrent_state_operations_do_not_touch_cache():
+    class ForbiddenCache:
+        def __getitem__(self, indices):
+            raise AssertionError("empty state operation accessed the cache")
+
+        def __setitem__(self, indices, value):
+            raise AssertionError("empty state operation wrote the cache")
+
+    storage = Rwkv7HybridCacheStorage()
+    storage.kv_cache = ForbiddenCache()
+    empty = torch.empty(0, dtype=torch.long)
+    storage.reset_state_slots(empty)
+    storage.copy_state_slots(empty, empty)
+
+
+def test_recurrent_preprocess_skips_steady_decode_and_preserves_page_transitions():
+    np = pytest.importorskip("numpy")
+    from irwkv.v1.worker.gpu.model_states.rwkv7_hybrid import Rwkv7HybridModelState
+
+    class RecordingCache:
+        def __init__(self):
+            self.resets = []
+            self.copies = []
+
+        def reset_state_slots(self, indices):
+            self.resets.append(indices.tolist())
+
+        def copy_state_slots(self, sources, destinations):
+            self.copies.append((sources.tolist(), destinations.tolist()))
+
+    caches = [RecordingCache(), RecordingCache()]
+    state = object.__new__(Rwkv7HybridModelState)
+    state.irwkv_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align")
+    )
+    state.device = torch.device("cpu")
+    state._computed = np.array([0], dtype=np.int64)
+    state._groups = [(0, 80, caches)]
+    batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping_np=np.array([0]),
+        num_scheduled_tokens=np.array([1]),
+    )
+    tables = [torch.tensor([[4, 5]])]
+
+    state.preprocess_state(batch, tables, None, None)
+    for cache in caches:
+        assert cache.resets == [[4]]
+        assert cache.copies == []
+
+    state.preprocess_state(batch, tables, None, None)
+    for cache in caches:
+        assert cache.resets == [[4]]
+        assert cache.copies == []
+
+    batch.num_scheduled_tokens[0] = 79
+    state.preprocess_state(batch, tables, None, None)
+    for cache in caches:
+        assert cache.resets == [[4]]
+        assert cache.copies == [([4], [5])]
+
+
 @pytest.mark.skipif(
     os.environ.get("IRWKV_TEST_FLASH_HYBRID") != "1",
     reason="Requires the installed Linux CUDA engine environment",
@@ -238,12 +321,13 @@ def test_engine_config_preserves_hybrid_geometry_and_cache_mode(tmp_path):
 
 @pytest.mark.skipif(
     os.environ.get("IRWKV_TEST_FLASH_HYBRID") != "1",
-    reason="Set IRWKV_TEST_FLASH_HYBRID=1 on Linux with FlashRWKV2 and CUDA",
+    reason="Set IRWKV_TEST_FLASH_HYBRID=1 on Linux with RWKV CUDA backends",
 )
 @pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("recurrent_backend", ["flashrwkv2", "albatross"])
 @torch.inference_mode()
-def test_full_hybrid_flash_recurrence_and_paged_attention(batch_size):
-    """Exercise real serving storage and FlashRWKV2 across prefill and decode."""
+def test_full_hybrid_recurrence_and_paged_attention(batch_size, recurrent_backend):
+    """Exercise real serving storage and recurrent backends through decode."""
     import flashrwkv2
 
     model = initialized_model("cuda", torch.bfloat16)
@@ -256,6 +340,7 @@ def test_full_hybrid_flash_recurrence_and_paged_attention(batch_size):
     for index in range(8):
         cache = Rwkv7HybridCacheStorage()
         cache.num_heads = 1
+        cache.use_albatross = recurrent_backend == "albatross"
         if index % 4 != 3:
             cache.kv_cache = torch.zeros(
                 12, 1, 1, 128 + 64 * 64 * 4, dtype=torch.int8, device="cuda"
@@ -397,7 +482,8 @@ def test_full_model_against_original_bux_modules(dtype, monkeypatch):
             mixed = mixer(value, ctx)
         else:
             q, k, v = [
-                p(value).unflatten(-1, (1, 64)) for p in (source.q, source.k, source.v)
+                p.unflatten(-1, (1, 64))
+                for p in source.qkv(value).chunk(3, dim=-1)
             ]
             q, k = rope(q, ctx.positions), rope(k, ctx.positions)
             scores = torch.einsum("bthd,bshd->bhts", q.float(), k.float()) / 8

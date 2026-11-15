@@ -46,15 +46,20 @@ class Rwkv7HybridModelState(DefaultModelState):
             for group_id, block_size, caches in self._groups:
                 old, new = (computed - 1) // block_size, (end - 1) // block_size
                 rows = np.flatnonzero((old >= 0) & (old != new))
-                rows_gpu = torch.as_tensor(rows, device=self.device)
-                old_gpu = torch.as_tensor(old[rows], device=self.device)
-                new_gpu = torch.as_tensor(new[rows], device=self.device)
+                fresh = np.flatnonzero(old < 0)
                 table = block_tables[group_id]
-                for cache in caches:
-                    fresh = torch.as_tensor(np.flatnonzero(old < 0), device=self.device)
-                    fresh_columns = torch.as_tensor(new[old < 0], device=self.device)
-                    cache.reset_state_slots(table[fresh, fresh_columns].long())
-                    cache.copy_state_slots(
-                        table[rows_gpu, old_gpu].long(), table[rows_gpu, new_gpu].long()
-                    )
+                if fresh.size:
+                    fresh_gpu = torch.as_tensor(fresh, device=self.device)
+                    fresh_columns = torch.as_tensor(new[fresh], device=self.device)
+                    fresh_slots = table[fresh_gpu, fresh_columns].long()
+                    for cache in caches:
+                        cache.reset_state_slots(fresh_slots)
+                if rows.size:
+                    rows_gpu = torch.as_tensor(rows, device=self.device)
+                    old_gpu = torch.as_tensor(old[rows], device=self.device)
+                    new_gpu = torch.as_tensor(new[rows], device=self.device)
+                    sources = table[rows_gpu, old_gpu].long()
+                    destinations = table[rows_gpu, new_gpu].long()
+                    for cache in caches:
+                        cache.copy_state_slots(sources, destinations)
         self._computed[requests] = end

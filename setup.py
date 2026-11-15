@@ -343,6 +343,7 @@ if not _is_cuda():
 ext_modules = [
     CMakeExtension(name="irwkv.cumem_allocator"),
     CMakeExtension(name="irwkv.rwkv7_ops"),
+    CMakeExtension(name="irwkv.rwkv7_albatross_ops"),
 ]
 
 

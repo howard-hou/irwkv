@@ -4,11 +4,12 @@
 import torch
 from torch import nn
 
+from irwkv import envs
 from irwkv.forward_context import get_forward_context
 from irwkv.model_executor.layers.attention_layer_base import AttentionLayerBase
 from irwkv.model_executor.models.interfaces import HasInnerState, IsHybrid
 from irwkv.model_executor.models.rwkv import _load_flashrwkv2
-from irwkv.model_executor.models.utils import AutoWeightsLoader
+from irwkv.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from irwkv.models.rwkv7_hybrid import Rwkv7HybridCacheStorage, Rwkv7HybridModel
 from irwkv.v1.attention.backends.rwkv7_hybrid import (
     Rwkv7HybridAttentionBackend,
@@ -24,6 +25,9 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
         self.irwkv_config = irwkv_config
         self.prefix = prefix
         self.recurrent = recurrent
+        self.use_albatross = (
+            recurrent and envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND == "albatross"
+        )
         self.num_heads = irwkv_config.model_config.hf_config.num_attention_heads
         self._live_graph_tickets = []
         self.register_buffer("kv_cache", torch.empty(0), persistent=False)
@@ -40,6 +44,8 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
         )
 
     def prepare_metadata_ticket(self, metadata, *, retain_ticket=False):
+        if self.use_albatross and metadata.max_query_len == 1:
+            return None
         return self.prepare_recurrent_metadata(
             metadata, _load_flashrwkv2(), retain_ticket=retain_ticket
         )
@@ -133,4 +139,13 @@ class Rwkv7HybridForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return self.lm_head(hidden_states).float()
 
     def load_weights(self, weights):
-        return AutoWeightsLoader(self, skip_prefixes=["lm_head."]).load_weights(weights)
+        mapper = WeightsMapper(
+            orig_to_new_stacked={
+                ".mixer.q.": (".mixer.qkv.", 0),
+                ".mixer.k.": (".mixer.qkv.", 1),
+                ".mixer.v.": (".mixer.qkv.", 2),
+            }
+        )
+        return AutoWeightsLoader(self, skip_prefixes=["lm_head."]).load_weights(
+            weights, mapper=mapper
+        )

@@ -1,8 +1,9 @@
 # bux RWKV-7 / RoPE Hybrid
 
 Experimental adapter for [pilot7747/bux](https://github.com/pilot7747/bux/tree/03d5031fcc842ae4a4992921356af31b1bceaee0).
-The complete FlashRWKV2 path, paged attention, full-decode CUDA Graphs and engine
-generation have been exercised on Colab A100. Inductor compilation remains disabled.
+The FlashRWKV2 and optional Albatross recurrent paths, paged attention,
+full-decode CUDA Graphs and engine generation have been exercised on Colab A100.
+Inductor compilation remains disabled.
 
 ## Architecture
 
@@ -30,9 +31,9 @@ the meta device, including biases and normalization.
 
 Scheduler-owned attention pages store BF16 K/V. Each recurrent layer has a
 scheduler-owned page containing BF16 token shift and FP32 recurrent state.
-The adapter gathers contiguous state for FlashRWKV2 and writes it back after
-each batch. Prefix-boundary transitions copy recurrent state; generic block
-copies and resets cover both cache types.
+The adapter gathers contiguous state for the selected recurrent backend and
+writes it back after each batch. Prefix-boundary transitions copy recurrent
+state; generic block copies and resets cover both cache types.
 
 Supported scope: BF16 weights/KV, FP32 recurrent state, TP=PP=1, chunked prefill,
 recurrent cache modes none and align. CUDA attention uses vLLM 0.32.0's paged FA2
@@ -43,12 +44,22 @@ Quantization, FP8 KV, distributed execution, cache transfer and offload are
 rejected. Recurrent-state gathering and eager prefill dispatch still introduce
 overhead.
 
+`IRWKV_RWKV_HYBRID_RECURRENT_BACKEND=flashrwkv2` is the default. Setting it to
+`albatross` replaces only uniform one-token-per-request decode with the CUDA
+kernel derived from BlinkDL/Albatross; variable-length prefill continues to use
+FlashRWKV2 without padding. The derived kernel accepts BF16 inputs and updates
+FP32 state on the current CUDA stream. Albatross pages retain its native `[K,V]`
+state layout, while FlashRWKV2 pages use `[V,K]`, so decode needs no layout
+conversion. Select the backend before engine startup and build the
+`rwkv7_albatross_ops` extension.
+
 CUDA defaults to `CompilationMode.NONE` with full-decode CUDA Graphs. The engine
 reports this as `FULL_DECODE_ONLY`; prefill remains eager. Paged FA2 uses live GPU
 sequence lengths and block tables during replay. FlashRWKV2 metadata tickets and
 recurrent slot tensors are prepared outside capture, retained for graph reuse and
-shared by all recurrent layers in a batch. `enforce_eager=True` remains available
-for debugging. No Inductor or `torch.compile` result is claimed.
+shared by all recurrent layers in a batch. Albatross decode does not prepare
+FlashRWKV2 metadata tickets. `enforce_eager=True` remains available for debugging.
+No Inductor or `torch.compile` result is claimed.
 
 Native irwkv parameter names are accepted. A bux checkpoint-name conversion is
 not supplied. Dummy weights support timing, not meaningful generated text or
@@ -65,12 +76,12 @@ IRWKV_TEST_FLASH_HYBRID=1 .venv/bin/python -m pytest --noconftest \
   tests/models/rwkv/test_rwkv7_hybrid.py -q
 ```
 
-The explicit GPU test fails if FlashRWKV2/CUDA is missing. It compares a complete
-eight-layer BF16 model using actual FlashRWKV2 and paged attention against the
-reference through prefill and decode. Default tests cover complete-model
-chunking/prefix forks, page isolation/reset/copy/padding, configuration and
-parameter counts. They do not exhaustively certify scheduler preemption or
-trained-model quality. No single-layer microbenchmark is used.
+The explicit GPU test fails if the required CUDA backend is missing. It compares
+a complete eight-layer BF16 model using FlashRWKV2 and Albatross, with one and
+two requests, against the reference through prefill and decode. Default tests
+cover complete-model chunking/prefix forks, page isolation/reset/copy/padding,
+configuration and parameter counts. They do not exhaustively certify scheduler
+preemption or trained-model quality. No single-layer microbenchmark is used.
 
 For independent source comparison, clone the pinned bux revision and set
 `BUX_HF_SOURCE` to its `src/bux/export/hf` directory. The additional full-model
@@ -170,6 +181,41 @@ was not run for widths 3584 and 3840.
 A pre-optimization trace of 32 unique decode steps averaged 234.26 ms/token, with
 50.97 ms GPU-active and 183.29 ms GPU-idle time. These instrumented measurements
 located host/dispatch overhead and are not throughput baseline results.
+
+### Albatross recurrent decode A/B (2026-11-15)
+
+The optional decode kernel was derived from BlinkDL/Albatross at
+`545dd1870ea6cf424d7f7d4da16b7f87491405db`. Thirteen tests passed and the two
+optional original-bux-source comparisons were skipped. The full-model cases
+covered both recurrent backends and batch sizes one and two. Five consecutive
+CUDA Graph replays also matched the FP32 reference; the largest state error was
+1.23e-7. A small asynchronous engine completed full-decode graph capture and
+generation with concurrency two.
+
+The original 3328 Agent workload then ran sequentially in one A100 session with
+identical BF16 precision, paged FA2, full-decode graphs and workload defaults:
+
+| Metric | FlashRWKV2 repeat | Albatross decode |
+| --- | ---: | ---: |
+| Timed duration | 139.11 s | 138.91 s |
+| Output tokens/s | 29.4 | 29.5 |
+| Median TPOT | 31.61 ms | 31.56 ms |
+| p90 TPOT | 32.30 ms | 32.28 ms |
+| Median first-turn TTFT | 3.229 s | 3.227 s |
+| Prefix cache hit | 72.09% | 72.09% |
+
+The 0.05 ms median TPOT difference is negligible in these single runs. The
+Albatross backend therefore remains optional; FlashRWKV2 is still the default.
+This A/B does not claim that the remaining gap to the author's 22.20 ms can be
+closed by replacing the recurrent kernel alone.
+
+A 32-step full-decode graph trace attributes only 7.219 ms in total to the
+Albatross kernel, or 0.226 ms/token. The three largest GEMM kernel groups account
+for 10.78 ms/token and paged FA2 for 3.04 ms/token. GPU activity occupies 24.17
+ms/token in this instrumented trace. The profiler-inflated 44.34 ms mean iteration
+is not a throughput measurement. Further decode work must address the GEMMs,
+attention and copy/synchronization overhead rather than recurrent substitution
+alone.
 
 The engine configuration check exposed and fixed a reference to the removed
 ModelConfig.quantization field. SDPA now uses four-dimensional inputs and

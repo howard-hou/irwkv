@@ -28,6 +28,13 @@ def _load_paged_fa2():
     return flash_attn_varlen_func
 
 
+@cache
+def _load_albatross():
+    from irwkv import rwkv7_albatross_ops  # noqa: F401
+
+    return torch.ops.irwkv7_albatross.forward_decode
+
+
 class Rwkv7HybridLayerNorm(nn.LayerNorm):
     def forward(self, x):
         centered = x.float() - x.float().mean(-1, keepdim=True)
@@ -93,14 +100,29 @@ class Rwkv7HybridMixer(nn.Module):
         return self.o(out.flatten(1) * self.g(xg))
 
 
+def _load_fused_qkv(param, tensor):
+    shard = getattr(tensor, "shard_id", None)
+    if shard is None:
+        if param.shape != tensor.shape:
+            raise ValueError(f"QKV shape mismatch: {param.shape} != {tensor.shape}")
+        param.data.copy_(tensor)
+        return
+    if shard not in (0, 1, 2) or tensor.ndim not in (1, 2):
+        raise ValueError(f"Invalid QKV shard {shard} with shape {tensor.shape}")
+    target = param.data.narrow(0, shard * tensor.shape[0], tensor.shape[0])
+    if target.shape != tensor.shape:
+        raise ValueError(f"QKV shard shape mismatch: {target.shape} != {tensor.shape}")
+    target.copy_(tensor)
+
+
 class Rwkv7HybridAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         width = config.hidden_size
         self.num_heads = width // 64
-        self.q = nn.Linear(width, width, bias=True)
-        self.k = nn.Linear(width, width, bias=True)
-        self.v = nn.Linear(width, width, bias=True)
+        self.qkv = nn.Linear(width, 3 * width, bias=True)
+        self.qkv.weight.weight_loader = _load_fused_qkv
+        self.qkv.bias.weight_loader = _load_fused_qkv
         self.o = nn.Linear(width, width, bias=True)
 
     @staticmethod
@@ -115,8 +137,8 @@ class Rwkv7HybridAttention(nn.Module):
 
     def forward(self, x, positions, attention: Callable):
         q, k, v = (
-            projection(x).unflatten(-1, (self.num_heads, 64))
-            for projection in (self.q, self.k, self.v)
+            projection.unflatten(-1, (self.num_heads, 64))
+            for projection in self.qkv(x).chunk(3, dim=-1)
         )
         q, k = self.rotary(q, positions), self.rotary(k, positions)
         return self.o(attention(q, k, v).flatten(1))
@@ -181,9 +203,13 @@ class Rwkv7HybridCacheStorage:
         return previous, state
 
     def reset_state_slots(self, indices):
+        if len(indices) == 0:
+            return
         self.kv_cache[indices] = 0
 
     def copy_state_slots(self, sources, destinations):
+        if len(sources) == len(destinations) == 0:
+            return
         self.kv_cache[destinations] = self.kv_cache[sources]
 
     def prepare_recurrent_metadata(self, metadata, flash, *, retain_ticket=False):
@@ -210,19 +236,35 @@ class Rwkv7HybridCacheStorage:
         previous = torch.roll(x, 1, 0)
         starts = metadata.cu_seqlens[:-1].long()
         previous[starts] = previous_pool[indices]
-        # FlashRWKV2 requires contiguous state. The scheduler's strided page
-        # remains authoritative, including copy-on-write and prefix snapshots.
+        albatross_state = getattr(self, "use_albatross", False)
+        albatross_decode = albatross_state and metadata.max_query_len == 1
+        # The scheduler's strided page remains authoritative, including
+        # copy-on-write and prefix snapshots. Keep the selected backend's native
+        # layout in the page: Albatross uses [K,V], FlashRWKV2 uses [V,K].
+        # In particular, Albatross decode must not transpose the state per step.
         state = state_pool.index_select(0, indices).contiguous()
-        handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
-        if getattr(metadata, "validated_metadata", None) is None:
-            self.prepare_recurrent_metadata(metadata, flash)
-        slots = metadata.recurrent_slots
-        max_length = metadata.max_recurrent_seq_len
-        ticket = metadata.validated_metadata
+        handle = None
+        slots = max_length = ticket = None
+        if not albatross_decode:
+            handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+                state
+            )
+            if getattr(metadata, "validated_metadata", None) is None:
+                self.prepare_recurrent_metadata(metadata, flash)
+            slots = metadata.recurrent_slots
+            max_length = metadata.max_recurrent_seq_len
+            ticket = metadata.validated_metadata
 
         def recur(r, decay, k, v, a, b):
+            tensors = tuple(
+                tensor.contiguous() for tensor in (r, decay, k, v, a, b)
+            )
+            if albatross_decode:
+                output = torch.empty_like(r)
+                _load_albatross()(state, *tensors, output)
+                return output
             return flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-                *(tensor.contiguous() for tensor in (r, decay, k, v, a, b)),
+                *tensors,
                 state=handle,
                 cu_seqlens=metadata.cu_seqlens,
                 state_indices=slots,

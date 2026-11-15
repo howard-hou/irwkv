@@ -1,8 +1,8 @@
 # Incremental Compilation Workflow
 
-The RWKV build contains the `rwkv7_ops` and `cumem_allocator` CUDA extensions.
-Use CMake to rebuild them after changing files in `csrc/` without reinstalling
-the whole package.
+The RWKV build contains the `rwkv7_ops`, `rwkv7_albatross_ops` and
+`cumem_allocator` CUDA extensions. Use CMake to rebuild them after changing
+files in `csrc/` without reinstalling the whole package.
 
 ## Prerequisites
 
@@ -27,8 +27,9 @@ cmake -S . -B build/irwkv -G Ninja \
   -DIRWKV_TARGET_DEVICE=cuda \
   -DIRWKV_PYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
   -DCMAKE_INSTALL_PREFIX="$PWD"
-cmake --build build/irwkv --target rwkv7_ops cumem_allocator
+cmake --build build/irwkv --target rwkv7_ops rwkv7_albatross_ops cumem_allocator
 cmake --install build/irwkv --component rwkv7_ops
+cmake --install build/irwkv --component rwkv7_albatross_ops
 cmake --install build/irwkv --component cumem_allocator
 ```
 
