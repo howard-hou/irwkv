@@ -32,11 +32,13 @@ def _load_paged_fa2():
 def _load_albatross():
     from irwkv import rwkv7_albatross_ops  # noqa: F401
 
-    return torch.ops.irwkv7_albatross.forward_decode
+    return torch.ops.irwkv7_albatross
 
 
 class Rwkv7HybridLayerNorm(nn.LayerNorm):
     def forward(self, x):
+        if x.is_cuda and x.dtype == torch.bfloat16:
+            return _load_albatross().layer_norm(x, self.weight, self.bias, self.eps)
         centered = x.float() - x.float().mean(-1, keepdim=True)
         normalized = centered * torch.rsqrt(
             centered.square().mean(-1, keepdim=True) + self.eps
@@ -79,25 +81,52 @@ class Rwkv7HybridMixer(nn.Module):
         self.norm_weight = nn.Parameter(torch.empty(self.num_heads, 64))
         self.norm_bias = nn.Parameter(torch.empty(self.num_heads, 64))
 
-    def forward(self, x, previous, recurrence: Callable):
-        xr, xw, xk, xv, xa, xg = (x + (previous - x) * self.shift[:, None]).unbind(0)
+    def forward(
+        self, x, previous, recurrence: Callable, fused_decode=False, shifted=None
+    ):
+        if shifted is None:
+            shifted = x + (previous - x) * self.shift[:, None]
+        xr, xw, xk, xv, xa, xg = shifted.unbind(0)
         r = self.r(xr).unflatten(-1, (self.num_heads, 64))
         k = self.k(xk)
         v = self.v(xv).unflatten(-1, (self.num_heads, 64))
         decay = self.w(xw).unflatten(-1, (self.num_heads, 64))
-        a = self.a(xa).sigmoid()
-        kk = (k * self.k_k).unflatten(-1, (self.num_heads, 64)).float()
-        kk = (kk * torch.rsqrt(kk.square().sum(-1, keepdim=True) + 1e-12)).to(x.dtype)
-        k = (k * (1 + (a - 1) * self.k_a)).unflatten(-1, (self.num_heads, 64))
-        a = a.unflatten(-1, (self.num_heads, 64))
-        out = recurrence(r, decay, k, v, -kk, kk * a)
+        a = self.a(xa)
+        g = self.g(xg)
+        if fused_decode:
+            k, a, b = _load_albatross().kk_pre_decode(k, self.k_k, a, self.k_a)
+            k = k.unflatten(-1, (self.num_heads, 64))
+            a = a.unflatten(-1, (self.num_heads, 64))
+            b = b.unflatten(-1, (self.num_heads, 64))
+        else:
+            a = a.sigmoid()
+            kk = (k * self.k_k).unflatten(-1, (self.num_heads, 64)).float()
+            kk = (
+                kk * torch.rsqrt(kk.square().sum(-1, keepdim=True) + 1e-12)
+            ).to(x.dtype)
+            k = (k * (1 + (a - 1) * self.k_a)).unflatten(-1, (self.num_heads, 64))
+            a = a.unflatten(-1, (self.num_heads, 64))
+            a, b = -kk, kk * a
+        out = recurrence(r, decay, k, v, a, b)
+        if fused_decode:
+            out = _load_albatross().post_decode(
+                out,
+                r,
+                k,
+                v,
+                self.r_k,
+                self.norm_weight,
+                self.norm_bias,
+                g,
+            )
+            return self.o(out.flatten(1))
         centered = out.float() - out.float().mean(-1, keepdim=True)
         out = (
             centered * torch.rsqrt(centered.square().mean(-1, keepdim=True) + 64e-5)
         ).to(x.dtype)
         out = out * self.norm_weight + self.norm_bias
         out = out + (r * k * self.r_k).sum(-1, keepdim=True) * v
-        return self.o(out.flatten(1) * self.g(xg))
+        return self.o(out.flatten(1) * g)
 
 
 def _load_fused_qkv(param, tensor):
@@ -135,12 +164,13 @@ class Rwkv7HybridAttention(nn.Module):
             (first * cosine - second * sine, second * cosine + first * sine), -1
         ).to(x.dtype)
 
-    def forward(self, x, positions, attention: Callable):
+    def forward(self, x, positions, attention: Callable, fused_decode=False):
         q, k, v = (
             projection.unflatten(-1, (self.num_heads, 64))
             for projection in self.qkv(x).chunk(3, dim=-1)
         )
-        q, k = self.rotary(q, positions), self.rotary(k, positions)
+        if not fused_decode:
+            q, k = self.rotary(q, positions), self.rotary(k, positions)
         return self.o(attention(q, k, v).flatten(1))
 
 
@@ -233,19 +263,26 @@ class Rwkv7HybridCacheStorage:
     def run_recurrent(self, mixer, x, metadata, flash):
         indices = metadata.state_indices
         previous_pool, state_pool = self.state_views()
-        previous = torch.roll(x, 1, 0)
-        starts = metadata.cu_seqlens[:-1].long()
-        previous[starts] = previous_pool[indices]
         albatross_state = getattr(self, "use_albatross", False)
         albatross_decode = albatross_state and metadata.max_query_len == 1
+        previous = shifted = None
+        if albatross_decode:
+            shifted = _load_albatross().shift_decode(
+                x, previous_pool, indices, mixer.shift
+            )
+        else:
+            previous = torch.roll(x, 1, 0)
+            starts = metadata.cu_seqlens[:-1].long()
+            previous[starts] = previous_pool[indices]
         # The scheduler's strided page remains authoritative, including
         # copy-on-write and prefix snapshots. Keep the selected backend's native
         # layout in the page: Albatross uses [K,V], FlashRWKV2 uses [V,K].
-        # In particular, Albatross decode must not transpose the state per step.
-        state = state_pool.index_select(0, indices).contiguous()
+        # Albatross updates indexed pool pages directly, without per-step copies.
+        state = None
         handle = None
         slots = max_length = ticket = None
         if not albatross_decode:
+            state = state_pool.index_select(0, indices).contiguous()
             handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
                 state
             )
@@ -261,7 +298,9 @@ class Rwkv7HybridCacheStorage:
             )
             if albatross_decode:
                 output = torch.empty_like(r)
-                _load_albatross()(state, *tensors, output)
+                _load_albatross().forward_decode(
+                    state_pool, indices, *tensors, output
+                )
                 return output
             return flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
                 *tensors,
@@ -272,18 +311,29 @@ class Rwkv7HybridCacheStorage:
                 validated_metadata=ticket,
             )
 
-        output = mixer(x, previous, recur)
-        state_pool[indices] = state
-        previous_pool[indices] = x[metadata.cu_seqlens[1:].long() - 1]
+        output = mixer(
+            x, previous, recur, fused_decode=albatross_decode, shifted=shifted
+        )
+        if not albatross_decode:
+            state_pool[indices] = state
+            previous_pool[indices] = x[metadata.cu_seqlens[1:].long() - 1]
         return output
 
-    def run_attention(self, q, k, v, metadata):
+    def run_attention(self, q, k, v, metadata, positions=None):
         cache = self.kv_cache
         block_size = cache.shape[2]
-        slots = metadata.slot_mapping.long()
-        blocks, offsets = slots // block_size, slots % block_size
-        cache[blocks, :, offsets, :64] = k
-        cache[blocks, :, offsets, 64:] = v
+        fused_decode = (
+            q.is_cuda and metadata.max_query_len == 1 and positions is not None
+        )
+        if fused_decode:
+            q, k = _load_albatross().attention_prepare_decode(
+                q, k, v, positions, metadata.slot_mapping, cache
+            )
+        else:
+            slots = metadata.slot_mapping.long()
+            blocks, offsets = slots // block_size, slots % block_size
+            cache[blocks, :, offsets, :64] = k
+            cache[blocks, :, offsets, 64:] = v
         if q.is_cuda:
             paged = cache.transpose(1, 2)
             key_cache, value_cache = paged.split(64, dim=-1)

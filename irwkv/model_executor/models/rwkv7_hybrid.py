@@ -130,7 +130,12 @@ class Rwkv7HybridForCausalLM(nn.Module, HasInnerState, IsHybrid):
             if cache.recurrent:
                 return cache.run_recurrent(mixer, x, batch, _load_flashrwkv2())
             return mixer(
-                x, positions, lambda q, k, v: cache.run_attention(q, k, v, batch)
+                x,
+                positions,
+                lambda q, k, v: cache.run_attention(
+                    q, k, v, batch, positions=positions
+                ),
+                fused_decode=batch.max_query_len == 1,
             )
 
         return self.model(input_ids, run, inputs_embeds)

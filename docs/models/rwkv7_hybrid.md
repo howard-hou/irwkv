@@ -48,10 +48,12 @@ overhead.
 `albatross` replaces only uniform one-token-per-request decode with the CUDA
 kernel derived from BlinkDL/Albatross; variable-length prefill continues to use
 FlashRWKV2 without padding. The derived kernel accepts BF16 inputs and updates
-FP32 state on the current CUDA stream. Albatross pages retain its native `[K,V]`
-state layout, while FlashRWKV2 pages use `[V,K]`, so decode needs no layout
-conversion. Select the backend before engine startup and build the
-`rwkv7_albatross_ops` extension.
+FP32 state pages in place through `state_indices` on the current CUDA stream.
+The decode-only kk-pre and post kernels additionally fuse the small normalization,
+scaling, residual and gating operations while retaining eager BF16 intermediate
+rounding. Albatross pages retain its native `[K,V]` state layout, while
+FlashRWKV2 pages use `[V,K]`, so decode needs no layout conversion. Select the
+backend before engine startup and build the `rwkv7_albatross_ops` extension.
 
 CUDA defaults to `CompilationMode.NONE` with full-decode CUDA Graphs. The engine
 reports this as `FULL_DECODE_ONLY`; prefill remains eager. Paged FA2 uses live GPU
@@ -228,4 +230,112 @@ Target BF16 weights alone take approximately 13.3 / 16.6 / 20.3 GiB, before cach
 and workspace. The 24 GiB card cannot support the author's high-concurrency target
 workload. Exhaustive preemption tests, trained checkpoint conversion/evaluation,
 concurrency sweeps and Inductor/kernel-level parity work remain outstanding.
+
+### Fused Albatross decode A/B (2026-11-15)
+
+Following the inference formulas in BlinkDL/RWKV-LM `train_temp`, the Albatross
+decode path now fuses a-sigmoid, k scaling, kk normalization, `-kk` and `kk*a`
+into one kk-pre kernel, and output GroupNorm, the `r*k*r_k` residual and g gate
+into one post kernel. Decay sigmoid/exp remain inside the recurrent kernel. The
+recurrent kernel also updates indexed FP32 state pages directly, eliminating the
+per-layer `index_select(...).contiguous()` gather and `state_pool[indices] = state`
+writeback. These changes do not alter eager prefill, CPU, FlashRWKV2 or other
+non-Albatross paths.
+
+The hybrid test file passed 17 tests with two optional bux-source tests skipped.
+Coverage includes fused/eager A/B, complete models on both recurrent backends,
+batch sizes one and two, non-contiguous state indices, chunked prefill/decode,
+paged attention and CUDA Graph replay.
+
+Uninstrumented 3328 BF16 Agent workloads ran sequentially in the same A100
+session at concurrency one, with full-decode CUDA Graphs and otherwise unchanged
+defaults. These are single-run A/B results:
+
+| Metric | Pre-fusion | Post-fusion | Change |
+| --- | ---: | ---: | ---: |
+| Timed duration | 116.64 s | 104.92 s | -10.0% |
+| Output tokens/s | 35.1 | 39.0 | +11.1% |
+| TPOT p50 | 26.15 ms | 23.29 ms | -2.86 ms (-10.9%) |
+| TPOT p90 | 26.81 ms | 23.95 ms | -2.86 ms (-10.7%) |
+| First-turn TTFT p50 | 3.207 s | 3.205 s | -0.002 s |
+
+Matching 32-step profiles used the first request's second turn. Excluding the
+first incomplete window leaves 30 start-to-start decode windows:
+
+| Trace category | Pre-fusion ms/token | Post-fusion ms/token | Delta |
+| --- | ---: | ---: | ---: |
+| GEMM | 13.604 | 13.497 | -0.107 |
+| Flash attention | 3.397 | 3.398 | +0.001 |
+| Recurrent main kernel | 0.252 | 0.257 | +0.005 |
+| Norm/reduction | 1.439 | 0.832 | -0.607 |
+| Elementwise, including new fused kernels | 4.356 | 2.975 | -1.380 |
+| Index/gather/scatter | 1.404 | 1.009 | -0.395 |
+| Copy/cat/roll | 2.027 | 1.466 | -0.561 |
+| Other GPU total | 9.281 | 6.338 | -2.943 |
+| All GPU activity sum | 26.535 | 23.491 | -3.044 |
+| Start-to-start cadence | 27.259 | 24.166 | -3.093 |
+| GPU busy union | 26.497 | 23.452 | -3.045 |
+| Exposed non-GPU gap | 0.761 | 0.713 | -0.048 |
+
+The FP32 state gather and 4D state writeback each removed about 38.93 calls per
+token. The new kk-pre and post kernels each ran about 38.9 times per token and
+took 0.1115 and 0.0942 ms/token respectively. Total GPU event calls fell from
+4688.97 to 3402.83 per token. GEMM, flash attention and the recurrent main kernel
+were effectively unchanged; the improvement came from fused small operators and
+state-management removal. Category values are event-duration sums, while GPU busy
+uses their interval union. The exposed gap is wall time minus that union, not
+pure CPU work. Profiler cadence explains the direction and attribution of the
+uninstrumented gain but is not itself a throughput baseline.
+
+### Second-round fusion and LayerNorm launch A/B (2026-11-16)
+
+The second decode-fusion round combined the six token shifts and previous-token
+state writeback into one kernel, and combined RoPE with paged KV-cache writes.
+The latter supports non-contiguous QKV inputs and the existing negative-slot
+semantics. A custom LayerNorm kernel preserved the eager path's BF16 rounding
+after normalization and affine operations. Its initial 128-thread configuration
+was inefficient for 3328 channels at batch one: each thread serially processed
+about 26 channels across three passes and two block reductions. The third round
+changed only this LayerNorm launch and reduction to 512 threads and 16 warps;
+it did not switch to native `F.layer_norm` or relax numerical tolerances.
+
+Both rounds passed 21 hybrid tests with two optional bux-source comparisons
+skipped, plus the full-decode-graph engine smoke. The second-round same-session
+A/B reduced median TPOT from 23.34 to 20.77 ms and timed duration from 105.16 to
+93.88 seconds. The third-round A/B then used the validated second-round source
+as its baseline, with the same A100, 3328 BF16 model, concurrency one, two
+sessions, four turns and 512 output tokens per turn:
+
+| Metric | Second round | Third round | Change |
+| --- | ---: | ---: | ---: |
+| Timed duration | 93.72 s | 87.41 s | -6.31 s (-6.73%) |
+| Output tokens/s | 43.7 | 46.9 | +7.32% |
+| TPOT p50 | 20.74 ms | 19.19 ms | -1.55 ms (-7.47%) |
+| TPOT p90 | 21.40 ms | 19.85 ms | -1.55 ms (-7.24%) |
+| First-turn TTFT p50 | 2.965 s | 2.965 s | unchanged |
+
+Matching 32-step profiles again used the first request's second turn, excluding
+the first incomplete window and averaging 30 start-to-start decode windows:
+
+| Trace category | Second round ms/token | Third round ms/token | Delta |
+| --- | ---: | ---: | ---: |
+| GEMM | 13.474 | 13.474 | approximately 0 |
+| Flash attention | 3.401 | 3.400 | -0.001 |
+| Recurrent main kernel | 0.258 | 0.259 | +0.001 |
+| Norm/reduction | 2.390 | 0.864 | -1.527 |
+| Elementwise | 0.883 | 0.883 | approximately 0 |
+| Index/gather/scatter | 0.085 | 0.085 | approximately 0 |
+| Copy/cat/roll | 0.020 | 0.020 | approximately 0 |
+| Other GPU total | 3.435 | 1.909 | -1.527 |
+| GPU busy union | 20.528 | 19.000 | -1.528 |
+| Exposed non-GPU gap | 0.577 | 0.614 | +0.037 |
+| Start-to-start cadence | 21.105 | 19.614 | -1.491 |
+
+The fused LayerNorm ran 104.633 times per token in both traces. Its total time
+fell from 2.384 to 0.858 ms/token, or from 22.79 to 8.20 microseconds per call:
+a 64.0% reduction and 2.78x speedup. The cadence improvement closely matches the
+LayerNorm reduction, while GEMM, flash attention, recurrent and the other small
+operator categories remained stable. These are single-run A/B measurements;
+profiler cadence supports attribution but is not an uninstrumented throughput
+baseline.
 
