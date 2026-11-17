@@ -6,9 +6,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <torch/extension.h>
 
 #include <tuple>
+#include <type_traits>
 
 namespace {
 
@@ -341,7 +343,7 @@ __device__ __forceinline__ float rope_component(
       : __fadd_rn(__fmul_rn(value, cosine), __fmul_rn(pair, sine));
 }
 
-template <typename PositionT, typename SlotT>
+template <typename CacheT, typename PositionT, typename SlotT>
 __global__ __launch_bounds__(kWarpsPerBlock * kWarpThreads) void
 rwkv7_fused_attention_prepare_decode_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
@@ -349,7 +351,7 @@ rwkv7_fused_attention_prepare_decode_kernel(
     const __nv_bfloat16* __restrict__ v_ptr,
     const PositionT* __restrict__ positions_ptr,
     const SlotT* __restrict__ slots_ptr,
-    __nv_bfloat16* __restrict__ cache_ptr,
+    CacheT* __restrict__ cache_ptr,
     __nv_bfloat16* __restrict__ output_q_ptr,
     __nv_bfloat16* __restrict__ output_k_ptr,
     int64_t q_token_stride,
@@ -401,10 +403,17 @@ rwkv7_fused_attention_prepare_decode_kernel(
   if (block < 0) {
     block += num_pages;
   }
-  __nv_bfloat16* cache = cache_ptr + block * cache_page_stride +
+  CacheT* cache = cache_ptr + block * cache_page_stride +
       head * cache_head_stride + offset * cache_slot_stride;
-  cache[channel] = to_bf16(rotated_k);
-  cache[kHeadSize + channel] = v[channel];
+  if constexpr (std::is_same_v<CacheT, __nv_bfloat16>) {
+    cache[channel] = to_bf16(rotated_k);
+    cache[kHeadSize + channel] = v[channel];
+  } else {
+    cache[channel] = __nv_cvt_float_to_fp8(
+        __bfloat162float(to_bf16(rotated_k)), __NV_SATFINITE, __NV_E4M3);
+    cache[kHeadSize + channel] = __nv_cvt_float_to_fp8(
+        __bfloat162float(v[channel]), __NV_SATFINITE, __NV_E4M3);
+  }
 }
 
 inline int64_t ceil_div(int64_t value, int64_t divisor) {
@@ -566,45 +575,53 @@ rwkv7_albatross_attention_prepare_decode_cuda(
   const int threads = kWarpsPerBlock * kWarpThreads;
   const int blocks = static_cast<int>(ceil_div(elements, threads));
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto launch = [&](auto position_marker, auto slot_marker) {
-    using PositionT = decltype(position_marker);
-    using SlotT = decltype(slot_marker);
-    rwkv7_fused_attention_prepare_decode_kernel<PositionT, SlotT>
-        <<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<at::BFloat16>()),
-            positions.data_ptr<PositionT>(),
-            slot_mapping.data_ptr<SlotT>(),
-            reinterpret_cast<__nv_bfloat16*>(cache.data_ptr<at::BFloat16>()),
-            reinterpret_cast<__nv_bfloat16*>(output_q.data_ptr<at::BFloat16>()),
-            reinterpret_cast<__nv_bfloat16*>(output_k.data_ptr<at::BFloat16>()),
-            q.stride(0),
-            q.stride(1),
-            k.stride(0),
-            k.stride(1),
-            v.stride(0),
-            v.stride(1),
-            cache.stride(0),
-            cache.stride(1),
-            cache.stride(2),
-            static_cast<int>(cache.size(2)),
-            static_cast<int>(cache.size(0)),
-            static_cast<int>(H),
-            elements);
+  auto launch_cache = [&](auto cache_marker) {
+    using CacheT = decltype(cache_marker);
+    auto launch = [&](auto position_marker, auto slot_marker) {
+      using PositionT = decltype(position_marker);
+      using SlotT = decltype(slot_marker);
+      rwkv7_fused_attention_prepare_decode_kernel<CacheT, PositionT, SlotT>
+          <<<blocks, threads, 0, stream>>>(
+              reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<at::BFloat16>()),
+              positions.data_ptr<PositionT>(),
+              slot_mapping.data_ptr<SlotT>(),
+              reinterpret_cast<CacheT*>(cache.data_ptr()),
+              reinterpret_cast<__nv_bfloat16*>(output_q.data_ptr<at::BFloat16>()),
+              reinterpret_cast<__nv_bfloat16*>(output_k.data_ptr<at::BFloat16>()),
+              q.stride(0),
+              q.stride(1),
+              k.stride(0),
+              k.stride(1),
+              v.stride(0),
+              v.stride(1),
+              cache.stride(0),
+              cache.stride(1),
+              cache.stride(2),
+              static_cast<int>(cache.size(2)),
+              static_cast<int>(cache.size(0)),
+              static_cast<int>(H),
+              elements);
+    };
+    if (positions.scalar_type() == torch::kInt32) {
+      if (slot_mapping.scalar_type() == torch::kInt32) {
+        launch(int32_t{}, int32_t{});
+      } else {
+        launch(int32_t{}, int64_t{});
+      }
+    } else {
+      if (slot_mapping.scalar_type() == torch::kInt32) {
+        launch(int64_t{}, int32_t{});
+      } else {
+        launch(int64_t{}, int64_t{});
+      }
+    }
   };
-  if (positions.scalar_type() == torch::kInt32) {
-    if (slot_mapping.scalar_type() == torch::kInt32) {
-      launch(int32_t{}, int32_t{});
-    } else {
-      launch(int32_t{}, int64_t{});
-    }
+  if (cache.scalar_type() == torch::kBFloat16) {
+    launch_cache(__nv_bfloat16{});
   } else {
-    if (slot_mapping.scalar_type() == torch::kInt32) {
-      launch(int64_t{}, int32_t{});
-    } else {
-      launch(int64_t{}, int64_t{});
-    }
+    launch_cache(__nv_fp8_storage_t{});
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {output_q, output_k};

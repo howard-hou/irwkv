@@ -29,20 +29,36 @@ the meta device, including biases and normalization.
 
 ## Cache and execution
 
-Scheduler-owned attention pages store BF16 K/V. Each recurrent layer has a
-scheduler-owned page containing BF16 token shift and FP32 recurrent state.
-The adapter gathers contiguous state for the selected recurrent backend and
-writes it back after each batch. Prefix-boundary transitions copy recurrent
-state; generic block copies and resets cover both cache types.
+Scheduler-owned attention pages store BF16 K/V by default, or FP8-E4M3 K/V with
+`--kv-cache-dtype fp8`. FP8 queries, keys and values use a fixed scale of 1.0
+and saturate to the E4M3 range. FP8 paged attention uses vLLM 0.32.0's FA3 on
+SM90, FA4 on SM100, and Triton unified attention on SM120, with Q/K/V descale
+tensors and BF16 output. The SM120 path uses the 2D kernel for prefill and the
+3D split-softmax kernel for eligible decode batches, including vLLM's SM120
+segment-count selection. BF16 attention continues to use paged FA2. Each
+recurrent layer has a scheduler-owned page containing BF16 token shift and FP32
+recurrent state; these states are not FP8 quantized. The adapter gathers
+contiguous state for the selected recurrent backend and writes it back after
+each batch. Prefix-boundary transitions copy recurrent state; generic block
+copies and resets cover both cache types.
 
-Supported scope: BF16 weights/KV, FP32 recurrent state, TP=PP=1, chunked prefill,
-recurrent cache modes none and align. CUDA attention uses vLLM 0.32.0's paged FA2
-with lower-right causal bias and reads scheduler-owned pages directly, without
-materializing each request's complete KV history. The attention block size must be
-divisible by 16. CPU tensor tests retain a PyTorch SDPA reference path.
-Quantization, FP8 KV, distributed execution, cache transfer and offload are
-rejected. Recurrent-state gathering and eager prefill dispatch still introduce
-overhead.
+`--quantization fp8` enables online per-tensor FP8-E4M3 weight quantization and
+dynamic per-token FP8 activation quantization for linear projections. Each fused
+QKV projection is quantized once with one scale after all three shards load.
+Weights use `amax / 448` with a minimum scale of 1e-12; CUDA uses scaled FP8 GEMM
+with BF16 output and the original bias. Embedding and tied LM-head weights stay
+in BF16. Pre-quantized checkpoints are not accepted. FP8 W8A8 requires SM89 or
+newer; combined FP8 weights and FP8 KV require SM90, SM100, or SM120.
+
+Supported scope: BF16 or online FP8 weights, BF16 or FP8 attention KV, FP32
+recurrent state, TP=PP=1, chunked prefill, and recurrent cache modes none and
+align. CUDA attention uses lower-right causal bias and reads scheduler-owned
+pages directly, without materializing each request's complete KV history. The
+attention block size must be divisible by 16. CPU tensor tests retain explicit
+FP8 dequantization and PyTorch SDPA reference paths; they are numerical tests,
+not a substitute for GPU kernel validation. Distributed execution, cache
+transfer and offload are rejected. Recurrent-state gathering and eager prefill
+dispatch still introduce overhead.
 
 `IRWKV_RWKV_HYBRID_RECURRENT_BACKEND=flashrwkv2` is the default. Setting it to
 `albatross` replaces only uniform one-token-per-request decode with the CUDA
@@ -56,9 +72,9 @@ FlashRWKV2 pages use `[V,K]`, so decode needs no layout conversion. Select the
 backend before engine startup and build the `rwkv7_albatross_ops` extension.
 
 CUDA defaults to `CompilationMode.NONE` with full-decode CUDA Graphs. The engine
-reports this as `FULL_DECODE_ONLY`; prefill remains eager. Paged FA2 uses live GPU
-sequence lengths and block tables during replay. FlashRWKV2 metadata tickets and
-recurrent slot tensors are prepared outside capture, retained for graph reuse and
+reports this as `FULL_DECODE_ONLY`; prefill remains eager. Paged attention uses
+live GPU sequence lengths and block tables during replay. FlashRWKV2 metadata
+tickets and recurrent slot tensors are prepared outside capture, retained for graph reuse and
 shared by all recurrent layers in a batch. Albatross decode does not prepare
 FlashRWKV2 metadata tickets. `enforce_eager=True` remains available for debugging.
 No Inductor or `torch.compile` result is claimed.
@@ -78,12 +94,17 @@ IRWKV_TEST_FLASH_HYBRID=1 .venv/bin/python -m pytest --noconftest \
   tests/models/rwkv/test_rwkv7_hybrid.py -q
 ```
 
-The explicit GPU test fails if the required CUDA backend is missing. It compares
+The explicit GPU tests fail if a required CUDA backend is missing. They compare
 a complete eight-layer BF16 model using FlashRWKV2 and Albatross, with one and
-two requests, against the reference through prefill and decode. Default tests
-cover complete-model chunking/prefix forks, page isolation/reset/copy/padding,
-configuration and parameter counts. They do not exhaustively certify scheduler
-preemption or trained-model quality. No single-layer microbenchmark is used.
+two requests, against the reference through prefill and decode. FP8-specific
+cases cover scaled GEMM on SM89+, fused RoPE/cache writes, paged FA3/FA4/Triton
+prefill and decode on SM90/SM100/SM120, descale arguments and engine cache-spec
+propagation.
+Default tests cover complete-model chunking/prefix forks, page
+isolation/reset/copy/padding, online FP8 rounding against an independent bux-style
+emulation, fused-QKV scaling, FP8 KV saturation, configuration and parameter
+counts. They do not exhaustively certify scheduler preemption or trained-model
+quality. No single-layer microbenchmark is used.
 
 For independent source comparison, clone the pinned bux revision and set
 `BUX_HF_SOURCE` to its `src/bux/export/hf` directory. The additional full-model
@@ -92,43 +113,60 @@ softmax oracle. FP32 passes at atol=rtol=2e-5. BF16 currently has a strict expec
 failure at atol=rtol=0.04 (observed maximum error 0.0859375 on the deterministic
 73-token test). The HF export and serving paths have different low-rank-bias and
 decay rounding; the cause of the full discrepancy has not been isolated. This is
-not a claim of exact BF16 numerical parity with bux or of parity with its FP8 path.
+not a claim of exact BF16 numerical parity with bux. The independent FP8 emulation
+checks quantization semantics, not trained-model accuracy or GPU kernel parity.
 
-Generate a small configuration and run a short engine workload first:
+Generate a small configuration and run a short BF16 engine workload first:
 
 ```bash
 .venv/bin/python -m tools.export_rwkv7_hybrid exported/hybrid-smoke \
   --width 64 --layers 4 --vocab-size 4096
-.venv/bin/python -m benchmarks.benchmark_rwkv7_hybrid_agentic \
+.venv/bin/python benchmarks/benchmark_rwkv7_hybrid_agentic.py \
   exported/hybrid-smoke --concurrency 2 --sessions 2 \
   --system 64 --context 128 --tool 32 --output 8 --turns 4 \
   --max-model-len 1024 --max-num-batched-tokens 128
 ```
 
+On SM90, SM100, or SM120, enable both bux FP8 settings explicitly:
+
+```bash
+.venv/bin/irwkv serve exported/hybrid-smoke \
+  --dtype bfloat16 --quantization fp8 --kv-cache-dtype fp8
+```
+
+The benchmark accepts the same two FP8 options while retaining BF16 activations,
+token shift and recurrent state.
+
 ## Author's Agent workload
 
 benchmarks/benchmark_rwkv7_hybrid_agentic.py preserves the author's
-scripts/old_vs_new/agentic.py workload, adapting engine imports and configuration
-attribute only. Defaults: shared prompt 2048, private context 14336, four turns,
+scripts/old_vs_new/agentic.py workload, with adapted engine imports and explicit
+FP8 options. Defaults: shared prompt 2048, private context 14336, four turns,
 512 output tokens/turn, 2048 tool tokens, sessions=2*concurrency, max context
 32768, batch-token limit 16384, seed 0, dummy BF16 weights, TP=1, prefix caching.
 It warms up and resets prefix caching between concurrency runs. JSON reports
-sessions/hour, TTFT, TPOT and cached tokens.
+sessions/hour, TTFT, TPOT, cached tokens and the selected precision options.
 
 ```bash
 for width in 3328 3584 3840; do
   .venv/bin/python -m tools.export_rwkv7_hybrid exported/hybrid-$width --width $width
-  .venv/bin/python -m benchmarks.benchmark_rwkv7_hybrid_agentic \
+  .venv/bin/python benchmarks/benchmark_rwkv7_hybrid_agentic.py \
     exported/hybrid-$width --concurrency 1,2,4,8,16,32,40 \
-    --slo 30 --tag irwkv-bf16-hybrid-$width > hybrid-$width.jsonl
+    --slo 30 --tag irwkv-bf16-hybrid-$width > hybrid-$width-bf16.jsonl
+  .venv/bin/python benchmarks/benchmark_rwkv7_hybrid_agentic.py \
+    exported/hybrid-$width --concurrency 1,2,4,8,16,32,40 \
+    --quantization fp8 --kv-cache-dtype fp8 \
+    --slo 30 --tag irwkv-fp8-hybrid-$width > hybrid-$width-fp8.jsonl
 done
 ```
 
-Run the original script and this adapter on the same GPU with matching BF16
-weight/KV and recurrent precision, model configuration, and workload. Record
-GPU, software/source revisions, cache capacity and options.
-Published target-width rows use B300 with FP8 weights and FP8 KV. This adapter
-cannot reproduce that precision setting: BF16 results are not directly comparable.
+The FP8 loop requires SM90, SM100, or SM120. Run the original script and this
+adapter on the same GPU with matching weight/KV and recurrent precision, model configuration
+and workload. Record GPU, software/source revisions, cache capacity and options.
+Published target-width rows use B300 with FP8 weights and FP8 KV. BF16 results
+are not directly comparable to those rows. No trained-model FP8 quality or
+throughput result is claimed until the corresponding exported model and workload
+have been evaluated.
 
 ## Validation record (2026-11-14)
 
@@ -219,9 +257,8 @@ is not a throughput measurement. Further decode work must address the GEMMs,
 attention and copy/synchronization overhead rather than recurrent substitution
 alone.
 
-The engine configuration check exposed and fixed a reference to the removed
-ModelConfig.quantization field. SDPA now uses four-dimensional inputs and
-lower-right causal bias. Colab setup needs the virtual environment bin directory
+SDPA uses four-dimensional inputs and lower-right causal bias. Colab setup needs
+the virtual environment bin directory
 on PATH for Ninja, Rust for the pinned tokenizer, and a setuptools-scm version
 override when building from a ZIP without Git metadata. The notebook includes
 these settings. FlashRWKV2 uses its untuned default configuration in these runs.

@@ -180,6 +180,8 @@ class ModelConfig:
     - "bfloat16" for a balance between precision and range.
     - "float" is shorthand for FP32 precision.
     - "float32" for FP32 precision."""
+    quantization: str | None = None
+    """Online quantization method. The bux hybrid supports ``fp8``."""
     seed: int = 0
     """Random seed for reproducibility.
 
@@ -981,7 +983,11 @@ class ModelConfig:
 
     def _verify_quantization(self) -> None:
         if self.model_arch_config.quantization_config is not None:
-            raise ValueError("RWKV requires unquantized BF16 weights.")
+            raise ValueError("RWKV requires an unquantized BF16 checkpoint.")
+        if self.quantization not in (None, "fp8"):
+            raise ValueError("RWKV supports only online FP8 quantization.")
+        if self.quantization == "fp8" and self.architecture != "Rwkv7HybridForCausalLM":
+            raise ValueError("Online FP8 quantization requires the bux hybrid.")
 
     def _verify_cuda_graph(self) -> None:
         # CUDAGraph capture not supported for encoder-decoder models on ROCm

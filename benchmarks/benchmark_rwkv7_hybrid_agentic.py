@@ -118,6 +118,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--tool", type=int, default=2048, help="tokens a tool adds a turn")
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    p.add_argument("--quantization", choices=["fp8"])
+    p.add_argument(
+        "--kv-cache-dtype", choices=["auto", "bfloat16", "fp8"], default="auto"
+    )
     p.add_argument("--max-num-batched-tokens", type=int, default=16384)
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
@@ -147,6 +151,8 @@ async def run(a: argparse.Namespace) -> None:
             max_model_len=a.max_model_len,
             enable_prefix_caching=True,
             gpu_memory_utilization=a.gpu_memory_utilization,
+            quantization=a.quantization,
+            kv_cache_dtype=a.kv_cache_dtype,
             max_num_seqs=max(a.concurrency),
             max_num_batched_tokens=a.max_num_batched_tokens,
             tensor_parallel_size=a.tp,
@@ -271,6 +277,8 @@ def _summary(a: argparse.Namespace, engine: AsyncLLM, totals: Totals, c: int) ->
     return {
         "tag": a.tag,
         "model": a.model,
+        "quantization": a.quantization,
+        "kv_cache_dtype": a.kv_cache_dtype,
         "concurrency": c,
         "sessions": a.sessions * c,
         "seconds": round(s, 2),

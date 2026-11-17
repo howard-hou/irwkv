@@ -16,7 +16,7 @@ from irwkv.v1.attention.backends.rwkv7_hybrid import (
     Rwkv7HybridRecurrentBackend,
 )
 from irwkv.v1.attention.backends.rwkv_attn import RwkvStateSpec
-from irwkv.v1.kv_cache_interface import FullAttentionSpec
+from irwkv.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
 
 class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
@@ -31,6 +31,8 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
         self.num_heads = irwkv_config.model_config.hf_config.num_attention_heads
         self._live_graph_tickets = []
         self.register_buffer("kv_cache", torch.empty(0), persistent=False)
+        for name in ("q_scale", "k_scale", "v_scale"):
+            self.register_buffer(name, torch.ones(1), persistent=False)
         context = irwkv_config.compilation_config.static_forward_context
         if prefix in context:
             raise ValueError(f"Duplicate cache layer {prefix}")
@@ -61,11 +63,13 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
                 page_size_padded=cache.mamba_page_size_padded,
                 mamba_cache_mode=cache.mamba_cache_mode,
             )
+        fp8 = cache.cache_dtype == "fp8"
         return FullAttentionSpec(
             block_size=cache.block_size,
             num_kv_heads=self.num_heads,
             head_size=64,
-            dtype=torch.bfloat16,
+            dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
+            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR if fp8 else KVQuantMode.NONE,
         )
 
 
@@ -75,7 +79,8 @@ class Rwkv7HybridForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def __init__(self, *, irwkv_config, prefix=""):
         super().__init__()
         self.config = irwkv_config.model_config.hf_config
-        self.model = Rwkv7HybridModel(self.config)
+        quantize = irwkv_config.model_config.quantization == "fp8"
+        self.model = Rwkv7HybridModel(self.config, quantize=quantize)
         self.caches = nn.ModuleList(
             Rwkv7HybridCache(
                 irwkv_config,
@@ -142,6 +147,9 @@ class Rwkv7HybridForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def compute_logits(self, hidden_states):
         return self.lm_head(hidden_states).float()
+
+    def process_weights_after_loading(self):
+        self.model.process_weights_after_loading()
 
     def load_weights(self, weights):
         mapper = WeightsMapper(

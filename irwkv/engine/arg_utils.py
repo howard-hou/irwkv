@@ -458,6 +458,7 @@ class EngineArgs:
     load_format: str | LoadFormats = LoadConfig.load_format
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
+    quantization: str | None = ModelConfig.quantization
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
@@ -831,6 +832,7 @@ class EngineArgs:
             "--trust-remote-code", **model_kwargs["trust_remote_code"]
         )
         model_group.add_argument("--dtype", **model_kwargs["dtype"])
+        model_group.add_argument("--quantization", **model_kwargs["quantization"])
         model_group.add_argument("--seed", **model_kwargs["seed"])
         model_group.add_argument("--hf-config-path", **model_kwargs["hf_config_path"])
         model_group.add_argument(
@@ -1720,6 +1722,7 @@ class EngineArgs:
             allowed_local_media_path=self.allowed_local_media_path,
             allowed_media_domains=self.allowed_media_domains,
             dtype=self.dtype,
+            quantization=self.quantization,
             seed=self.seed,
             revision=self.revision,
             code_revision=self.code_revision,

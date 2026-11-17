@@ -244,10 +244,12 @@ std::tuple<torch::Tensor, torch::Tensor> attention_prepare_decode(
         "positions and slot_mapping must be contiguous CUDA int32/int64 [B]");
   }
   TORCH_CHECK(
-      cache.is_cuda() && cache.scalar_type() == torch::kBFloat16 &&
+      cache.is_cuda() &&
+          (cache.scalar_type() == torch::kBFloat16 ||
+           cache.scalar_type() == torch::kFloat8_e4m3fn) &&
           cache.dim() == 4 && cache.size(1) == H && cache.size(3) == 128 &&
           cache.stride(3) == 1 && cache.size(2) > 0,
-      "cache must be CUDA BF16 [P,H,S,128] with contiguous channels");
+      "cache must be CUDA BF16/FP8-E4M3 [P,H,S,128] with contiguous channels");
   return rwkv7_albatross_attention_prepare_decode_cuda(
       q, k, v, positions, slot_mapping, cache);
 }

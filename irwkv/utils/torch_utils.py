@@ -870,7 +870,7 @@ def weak_ref_tensor(tensor: Any) -> Any:
     This ignores 0-size tensors as those don't allocate any memory.
     """
     if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
-        return torch.ops._C.weak_ref_tensor(tensor)
+        return torch.ops._RWKV_C.weak_ref_tensor(tensor)
     else:
         return tensor
 
@@ -923,7 +923,7 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
             return torch.ops._C.get_xpu_view_from_cpu_tensor(pinned)
         return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
     elif current_platform.is_cuda_alike():
-        return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
+        return torch.ops._RWKV_C.get_cuda_view_from_cpu_tensor(cpu_tensor)
     else:
         raise ValueError(
             f"`get_accelerator_view_from_cpu_tensor` is currently "

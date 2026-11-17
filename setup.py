@@ -71,7 +71,8 @@ def is_freethreaded():
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+        kwa.setdefault("py_limited_api", not is_freethreaded())
+        super().__init__(name, sources=[], **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -343,7 +344,7 @@ if not _is_cuda():
 ext_modules = [
     CMakeExtension(name="irwkv.cumem_allocator"),
     CMakeExtension(name="irwkv.rwkv7_ops"),
-    CMakeExtension(name="irwkv.rwkv7_albatross_ops"),
+    CMakeExtension(name="irwkv.rwkv7_albatross_ops", py_limited_api=False),
 ]
 
 

@@ -224,15 +224,27 @@ class Rwkv7HybridForCausalLMConfig(VerifyAndUpdateConfig):
             )
         ):
             raise ValueError("The bux hybrid currently supports TP=PP=DCP=PCP=1")
-        if getattr(
-            model.hf_config, "quantization_config", None
-        ) is not None or cache.cache_dtype not in (
-            "auto",
-            "bfloat16",
+        if getattr(model.hf_config, "quantization_config", None) is not None:
+            raise ValueError("The bux hybrid requires an unquantized BF16 checkpoint")
+        if model.quantization not in (None, "fp8"):
+            raise ValueError("The bux hybrid supports only online FP8 weights")
+        if cache.cache_dtype not in ("auto", "bfloat16", "fp8"):
+            raise ValueError("The bux hybrid supports BF16 and FP8 KV cache")
+        from irwkv.platforms import current_platform
+
+        capability = current_platform.get_device_capability()
+        if (
+            model.quantization == "fp8"
+            and current_platform.is_cuda()
+            and (capability is None or (capability.major, capability.minor) < (8, 9))
         ):
-            raise ValueError(
-                "The bux hybrid currently supports BF16 weights and KV cache"
-            )
+            raise ValueError("Hybrid FP8 W8A8 requires an SM89+ CUDA device")
+        if (
+            cache.cache_dtype == "fp8"
+            and current_platform.is_cuda()
+            and (capability is None or capability.major not in (9, 10, 12))
+        ):
+            raise ValueError("Hybrid FP8 KV cache requires SM90, SM100, or SM120")
         if (
             irwkv_config.kv_transfer_config is not None
             or cache.kv_offloading_size is not None
@@ -251,7 +263,9 @@ class Rwkv7HybridForCausalLMConfig(VerifyAndUpdateConfig):
         if cache.mamba_cache_dtype not in ("auto", "bfloat16"):
             raise ValueError("The hybrid token-shift cache requires bfloat16")
         if cache.block_size % 16:
-            raise ValueError("Hybrid paged FA2 requires block_size divisible by 16")
+            raise ValueError(
+                "Hybrid paged attention requires block_size divisible by 16"
+            )
         if not irwkv_config.scheduler_config.enable_chunked_prefill:
             raise ValueError("The bux hybrid requires chunked prefill")
         cache.mamba_ssm_cache_dtype = "float32"
@@ -283,8 +297,9 @@ class Rwkv7HybridForCausalLMConfig(VerifyAndUpdateConfig):
                     capture_sizes.append(max_capture)
                 compilation_config.cudagraph_capture_sizes = capture_sizes
         logger.info(
-            "bux hybrid uses paged FA2 and FlashRWKV2 with FP32 state; "
+            "bux hybrid uses paged %s attention and FlashRWKV2 with FP32 state; "
             "CUDA graph mode: %s",
+            "FA3/FA4/Triton FP8" if cache.cache_dtype == "fp8" else "FA2 BF16",
             compilation_config.cudagraph_mode,
         )
 
