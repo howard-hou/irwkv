@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """bux timeline hybrid served by irwkv with scheduler-owned KV and RWKV state."""
 
 import torch
@@ -62,8 +63,16 @@ def rwkv7_hybrid_recur(
     indices = metadata.state_indices
     _, state_pool = layer.state_views()
     tensors = tuple(tensor.contiguous() for tensor in (r, decay, k, v, a, b))
-    if envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND == "flashrwkv2":
-        state = state_pool.index_select(0, indices).contiguous()
+    backend = envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND
+    use_flash = backend == "flashrwkv2" or (
+        backend == "mixed" and metadata.max_query_len != 1
+    )
+    if use_flash:
+        state = state_pool.index_select(0, indices)
+        if backend == "mixed":
+            # Scheduler pages stay in Albatross [K,V] layout for decode/snapshots.
+            state = state.transpose(-1, -2)
+        state = state.contiguous()
         flash = _load_flashrwkv2()
         handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
         if metadata.validated_metadata is None:
@@ -78,6 +87,8 @@ def rwkv7_hybrid_recur(
                 validated_metadata=metadata.validated_metadata,
             )
         )
+        if backend == "mixed":
+            state = state.transpose(-1, -2)
         state_pool[indices] = state
         return
     ops = _load_albatross()
@@ -154,9 +165,11 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
         )
 
     def prepare_metadata_ticket(self, metadata, *, retain_ticket=False):
-        if (
-            not self.use_compiled_ops
-            or envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND != "flashrwkv2"
+        if not self.use_compiled_ops:
+            return None
+        backend = envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND
+        if backend == "albatross" or (
+            backend == "mixed" and metadata.max_query_len == 1
         ):
             return None
         return self.prepare_recurrent_metadata(

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Full hybrid parity and scheduler-page storage regressions.
 
 The tensor-only tests also run with pytest --noconftest on Windows.
@@ -633,38 +634,61 @@ def test_engine_config_preserves_hybrid_geometry_and_cache_mode(
         torch.testing.assert_close(scale, torch.ones(1), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("backend", ["albatross", "flashrwkv2"])
-def test_inductor_recurrent_backend_dispatch(monkeypatch, backend):
+@pytest.mark.parametrize(
+    ("backend", "max_query_len", "expected"),
+    [
+        ("albatross", 1, "albatross"),
+        ("flashrwkv2", 1, "flashrwkv2"),
+        ("mixed", 1, "albatross"),
+        ("mixed", 2, "flashrwkv2"),
+    ],
+)
+def test_inductor_recurrent_backend_dispatch(
+    monkeypatch, backend, max_query_len, expected
+):
     pytest.importorskip("openai_harmony")
     adapter = importlib.import_module("irwkv.model_executor.models.rwkv7_hybrid")
     monkeypatch.setenv("IRWKV_RWKV_HYBRID_RECURRENT_BACKEND", backend)
     inputs = [torch.randn(2, 1, 64) for _ in range(6)]
     state = torch.randn(5, 1, 64, 64)
-    indices = torch.tensor([3, 1])
+    initial_state = state.clone()
+    indices = torch.tensor([3] if max_query_len > 1 else [3, 1])
     output = torch.empty_like(inputs[0])
     metadata = SimpleNamespace(
         state_indices=indices,
-        max_query_len=1,
+        max_query_len=max_query_len,
         validated_metadata=object(),
-        recurrent_slots=torch.arange(2, dtype=torch.int32),
-        max_recurrent_seq_len=1,
-        cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32),
+        recurrent_slots=torch.arange(len(indices), dtype=torch.int32),
+        max_recurrent_seq_len=max_query_len,
+        cu_seqlens=torch.tensor(
+            [0, 2] if max_query_len > 1 else [0, 1, 2], dtype=torch.int32
+        ),
     )
     layer = SimpleNamespace(state_views=lambda: (None, state))
     monkeypatch.setattr(adapter, "_layer_and_metadata", lambda _: (layer, metadata))
     calls = []
+    prepared_inputs = []
 
     def albatross_decode(_state, _indices, *_args):
         calls.append("albatross")
         _args[-1].fill_(1)
 
-    def flash_decode(*args, **_kwargs):
+    def flash_prepare(value):
+        prepared_inputs.append(value.clone())
+        return value
+
+    def flash_recurrent(*args, **kwargs):
         calls.append("flashrwkv2")
+        flash_state = kwargs["state"]
+        updated = torch.arange(
+            flash_state.numel(), dtype=flash_state.dtype, device=flash_state.device
+        ).reshape(flash_state.shape)
+        flash_state.copy_(updated)
         return torch.ones_like(args[0])
 
     flash = SimpleNamespace(
-        prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor=lambda value: value,
-        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen=flash_decode,
+        prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor=flash_prepare,
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen=flash_recurrent,
     )
     albatross = SimpleNamespace(forward_decode=albatross_decode)
     monkeypatch.setattr(adapter, "_load_albatross", lambda: albatross)
@@ -672,8 +696,44 @@ def test_inductor_recurrent_backend_dispatch(monkeypatch, backend):
 
     adapter.rwkv7_hybrid_recur(*inputs, output, "model.layers.0.cache")
 
-    assert calls == [backend]
+    assert calls == [expected]
     torch.testing.assert_close(output, torch.ones_like(output))
+    if prepared_inputs:
+        expected_input = initial_state[indices]
+        expected_state = torch.arange(
+            expected_input.numel(),
+            dtype=expected_input.dtype,
+            device=expected_input.device,
+        ).reshape(expected_input.shape)
+        if backend == "mixed":
+            expected_input = expected_input.transpose(-1, -2)
+            expected_state = expected_state.transpose(-1, -2)
+        torch.testing.assert_close(prepared_inputs[0], expected_input)
+        torch.testing.assert_close(state[indices], expected_state)
+
+
+@pytest.mark.parametrize(("max_query_len", "prepares"), [(1, False), (2, True)])
+def test_mixed_inductor_prepares_flash_metadata_only_for_prefill(
+    monkeypatch, max_query_len, prepares
+):
+    pytest.importorskip("openai_harmony")
+    adapter = importlib.import_module("irwkv.model_executor.models.rwkv7_hybrid")
+    monkeypatch.setenv("IRWKV_RWKV_HYBRID_RECURRENT_BACKEND", "mixed")
+    ticket = object()
+    calls = []
+
+    def prepare(*args, **kwargs):
+        calls.append((args, kwargs))
+        return ticket
+
+    layer = SimpleNamespace(use_compiled_ops=True, prepare_recurrent_metadata=prepare)
+    monkeypatch.setattr(adapter, "_load_flashrwkv2", lambda: object())
+    metadata = SimpleNamespace(max_query_len=max_query_len)
+
+    result = adapter.Rwkv7HybridCache.prepare_metadata_ticket(layer, metadata)
+
+    assert result is (ticket if prepares else None)
+    assert len(calls) == int(prepares)
 
 
 @pytest.mark.skipif(
