@@ -4,13 +4,19 @@
 import torch
 from torch import nn
 
-from irwkv import envs
+from irwkv.compilation.decorators import support_torch_compile
+from irwkv.config.compilation import CompilationMode
 from irwkv.forward_context import get_forward_context
 from irwkv.model_executor.layers.attention_layer_base import AttentionLayerBase
 from irwkv.model_executor.models.interfaces import HasInnerState, IsHybrid
 from irwkv.model_executor.models.rwkv import _load_flashrwkv2
 from irwkv.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
-from irwkv.models.rwkv7_hybrid import Rwkv7HybridCacheStorage, Rwkv7HybridModel
+from irwkv.models.rwkv7_hybrid import (
+    Rwkv7HybridCacheStorage,
+    Rwkv7HybridModel,
+    _register_albatross_fakes,
+)
+from irwkv.utils.torch_utils import direct_register_custom_op
 from irwkv.v1.attention.backends.rwkv7_hybrid import (
     Rwkv7HybridAttentionBackend,
     Rwkv7HybridRecurrentBackend,
@@ -19,24 +25,117 @@ from irwkv.v1.attention.backends.rwkv_attn import RwkvStateSpec
 from irwkv.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
 
+def _layer_and_metadata(layer_name: str):
+    context = get_forward_context()
+    return (
+        context.no_compile_layers[layer_name],
+        context.attn_metadata[layer_name],
+    )
+
+
+def rwkv7_hybrid_shift(
+    x: torch.Tensor, out: torch.Tensor, shift: torch.Tensor, layer_name: str
+) -> None:
+    layer, metadata = _layer_and_metadata(layer_name)
+    indices = metadata.state_indices
+    previous_pool, _ = layer.state_views()
+    previous = torch.roll(x, 1, 0)
+    starts = metadata.cu_seqlens[:-1].long()
+    previous[starts] = previous_pool[indices]
+    out.copy_(x + (previous - x) * shift[:, None])
+    previous_pool[indices] = x[metadata.cu_seqlens[1:].long() - 1]
+
+
+def rwkv7_hybrid_recur(
+    r: torch.Tensor,
+    decay: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer, metadata = _layer_and_metadata(layer_name)
+    indices = metadata.state_indices
+    _, state_pool = layer.state_views()
+    state = state_pool.index_select(0, indices).contiguous()
+    flash = _load_flashrwkv2()
+    handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
+    if getattr(metadata, "validated_metadata", None) is None:
+        layer.prepare_recurrent_metadata(metadata, flash)
+    tensors = tuple(tensor.contiguous() for tensor in (r, decay, k, v, a, b))
+    out.copy_(
+        flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+            *tensors,
+            state=handle,
+            cu_seqlens=metadata.cu_seqlens,
+            state_indices=metadata.recurrent_slots,
+            max_seqlen=metadata.max_recurrent_seq_len,
+            validated_metadata=metadata.validated_metadata,
+        )
+    )
+    state_pool[indices] = state
+
+
+def rwkv7_hybrid_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer, metadata = _layer_and_metadata(layer_name)
+    layer.run_attention(q, k, v, metadata, positions, rotary=True, out=out)
+
+
+direct_register_custom_op(
+    op_name="rwkv7_hybrid_shift",
+    op_func=rwkv7_hybrid_shift,
+    mutates_args=["out"],
+)
+direct_register_custom_op(
+    op_name="rwkv7_hybrid_recur",
+    op_func=rwkv7_hybrid_recur,
+    mutates_args=["out"],
+)
+direct_register_custom_op(
+    op_name="rwkv7_hybrid_attention",
+    op_func=rwkv7_hybrid_attention,
+    mutates_args=["out"],
+)
+
+
 class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
     def __init__(self, irwkv_config, prefix, recurrent):
         super().__init__()
         self.irwkv_config = irwkv_config
         self.prefix = prefix
         self.recurrent = recurrent
-        self.use_albatross = (
-            recurrent and envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND == "albatross"
-        )
         self.num_heads = irwkv_config.model_config.hf_config.num_attention_heads
         self._live_graph_tickets = []
         self.register_buffer("kv_cache", torch.empty(0), persistent=False)
         for name in ("q_scale", "k_scale", "v_scale"):
             self.register_buffer(name, torch.ones(1), persistent=False)
-        context = irwkv_config.compilation_config.static_forward_context
+        compilation = irwkv_config.compilation_config
+        self.use_compiled_ops = compilation.mode != CompilationMode.NONE
+        if self.use_compiled_ops:
+            _register_albatross_fakes()
+        context = compilation.static_forward_context
         if prefix in context:
             raise ValueError(f"Duplicate cache layer {prefix}")
         context[prefix] = self
+        if self.use_compiled_ops and compilation.splitting_ops is not None:
+            names = (
+                ("rwkv7_hybrid_shift", "rwkv7_hybrid_recur")
+                if recurrent
+                else ("rwkv7_hybrid_attention",)
+            )
+            for name in names:
+                op = f"irwkv::{name}"
+                if op not in compilation.splitting_ops:
+                    compilation.splitting_ops.append(op)
 
     def get_attn_backend(self):
         return (
@@ -46,11 +145,32 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
         )
 
     def prepare_metadata_ticket(self, metadata, *, retain_ticket=False):
-        if self.use_albatross and metadata.max_query_len == 1:
+        if not self.use_compiled_ops and metadata.max_query_len == 1:
             return None
         return self.prepare_recurrent_metadata(
             metadata, _load_flashrwkv2(), retain_ticket=retain_ticket
         )
+
+    def run_recurrent_compiled(self, mixer, x):
+        shifted = x.new_empty((6, *x.shape))
+        torch.ops.irwkv.rwkv7_hybrid_shift(x, shifted, mixer.shift, self.prefix)
+        r, decay, k, v, a, b, g = mixer.prepare(shifted)
+        out = torch.empty_like(r)
+        torch.ops.irwkv.rwkv7_hybrid_recur(r, decay, k, v, a, b, out, self.prefix)
+        return mixer.post(out, r, k, v, g)
+
+    def run_attention_compiled(self, mixer, x, positions):
+        return mixer(
+            x,
+            positions,
+            lambda q, k, v: self._attention_op(q, k, v, positions),
+            fused_decode=True,
+        )
+
+    def _attention_op(self, q, k, v, positions):
+        out = torch.empty_like(q)
+        torch.ops.irwkv.rwkv7_hybrid_attention(q, k, v, positions, out, self.prefix)
+        return out
 
     def get_kv_cache_spec(self, irwkv_config):
         cache = irwkv_config.cache_config
@@ -73,6 +193,14 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
         )
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class Rwkv7HybridForCausalLM(nn.Module, HasInnerState, IsHybrid):
     supports_mamba_prefix_caching = True
 
@@ -131,6 +259,10 @@ class Rwkv7HybridForCausalLM(nn.Module, HasInnerState, IsHybrid):
                         x, torch.zeros_like(x), lambda r, *args: torch.zeros_like(r)
                     )
                 return mixer(x, positions, lambda q, k, v: torch.zeros_like(q))
+            if cache.use_compiled_ops:
+                if cache.recurrent:
+                    return cache.run_recurrent_compiled(mixer, x)
+                return cache.run_attention_compiled(mixer, x, positions)
             batch = metadata[cache.prefix]
             if cache.recurrent:
                 return cache.run_recurrent(mixer, x, batch, _load_flashrwkv2())

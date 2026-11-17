@@ -57,11 +57,28 @@ def _load_fp8_paged_attention():
     return flash_attn_varlen_func, version
 
 
+def _layer_norm_fake(x, weight, bias, eps):
+    return torch.empty_like(x)
+
+
 @cache
 def _load_albatross():
     from irwkv import rwkv7_albatross_ops  # noqa: F401
 
     return torch.ops.irwkv7_albatross
+
+
+@cache
+def _register_albatross_fakes():
+    _load_albatross()
+    torch.library.register_fake("irwkv7_albatross::layer_norm")(_layer_norm_fake)
+
+
+@cache
+def _load_cutlass_scaled_mm():
+    from vllm._custom_ops import cutlass_scaled_mm
+
+    return cutlass_scaled_mm
 
 
 def _fp8_quantize_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -110,13 +127,13 @@ class Rwkv7HybridLinear(nn.Linear):
             major, minor = torch.cuda.get_device_capability(x.device)
             if major < 8 or (major == 8 and minor < 9):
                 raise RuntimeError("Hybrid FP8 W8A8 requires an SM89+ CUDA device")
-            output = torch._scaled_mm(
+            output = _load_cutlass_scaled_mm()(
                 quantized,
                 self.weight.t(),
-                scale_a=scale,
-                scale_b=self.weight_scale_rowwise,
-                bias=self.bias,
+                scale,
+                self.weight_scale_rowwise,
                 out_dtype=self.orig_dtype,
+                bias=self.bias,
             )
         else:
             dequantized_x = (quantized.float() * scale).to(self.orig_dtype)
@@ -175,11 +192,7 @@ class Rwkv7HybridMixer(nn.Module):
         self.norm_weight = nn.Parameter(torch.empty(self.num_heads, 64))
         self.norm_bias = nn.Parameter(torch.empty(self.num_heads, 64))
 
-    def forward(
-        self, x, previous, recurrence: Callable, fused_decode=False, shifted=None
-    ):
-        if shifted is None:
-            shifted = x + (previous - x) * self.shift[:, None]
+    def prepare(self, shifted, fused_decode=False):
         xr, xw, xk, xv, xa, xg = shifted.unbind(0)
         r = self.r(xr).unflatten(-1, (self.num_heads, 64))
         k = self.k(xk)
@@ -196,12 +209,14 @@ class Rwkv7HybridMixer(nn.Module):
             a = a.sigmoid()
             kk = (k * self.k_k).unflatten(-1, (self.num_heads, 64)).float()
             kk = (kk * torch.rsqrt(kk.square().sum(-1, keepdim=True) + 1e-12)).to(
-                x.dtype
+                shifted.dtype
             )
             k = (k * (1 + (a - 1) * self.k_a)).unflatten(-1, (self.num_heads, 64))
             a = a.unflatten(-1, (self.num_heads, 64))
             a, b = -kk, kk * a
-        out = recurrence(r, decay, k, v, a, b)
+        return r, decay, k, v, a, b, g
+
+    def post(self, out, r, k, v, g, fused_decode=False):
         if fused_decode:
             out = _load_albatross().post_decode(
                 out,
@@ -217,10 +232,19 @@ class Rwkv7HybridMixer(nn.Module):
         centered = out.float() - out.float().mean(-1, keepdim=True)
         out = (
             centered * torch.rsqrt(centered.square().mean(-1, keepdim=True) + 64e-5)
-        ).to(x.dtype)
+        ).to(r.dtype)
         out = out * self.norm_weight + self.norm_bias
         out = out + (r * k * self.r_k).sum(-1, keepdim=True) * v
         return self.o(out.flatten(1) * g)
+
+    def forward(
+        self, x, previous, recurrence: Callable, fused_decode=False, shifted=None
+    ):
+        if shifted is None:
+            shifted = x + (previous - x) * self.shift[:, None]
+        r, decay, k, v, a, b, g = self.prepare(shifted, fused_decode)
+        out = recurrence(r, decay, k, v, a, b)
+        return self.post(out, r, k, v, g, fused_decode)
 
 
 def _load_fused_qkv(param, tensor):
@@ -365,8 +389,7 @@ class Rwkv7HybridCacheStorage:
     def run_recurrent(self, mixer, x, metadata, flash):
         indices = metadata.state_indices
         previous_pool, state_pool = self.state_views()
-        albatross_state = getattr(self, "use_albatross", False)
-        albatross_decode = albatross_state and metadata.max_query_len == 1
+        albatross_decode = metadata.max_query_len == 1
         previous = shifted = None
         if albatross_decode:
             shifted = _load_albatross().shift_decode(
@@ -415,7 +438,7 @@ class Rwkv7HybridCacheStorage:
             previous_pool[indices] = x[metadata.cu_seqlens[1:].long() - 1]
         return output
 
-    def run_attention(self, q, k, v, metadata, positions=None):
+    def run_attention(self, q, k, v, metadata, positions=None, rotary=False, out=None):
         cache = self.kv_cache
         block_size = cache.shape[2]
         fp8 = cache.dtype == _FP8_DTYPE
@@ -427,6 +450,11 @@ class Rwkv7HybridCacheStorage:
                 q, k, v, positions, metadata.slot_mapping, cache
             )
         else:
+            if rotary:
+                q, k = (
+                    Rwkv7HybridAttention.rotary(projection, positions)
+                    for projection in (q, k)
+                )
             slots = metadata.slot_mapping.long()
             blocks, offsets = slots // block_size, slots % block_size
             if fp8:
@@ -439,15 +467,19 @@ class Rwkv7HybridCacheStorage:
         if q.is_cuda:
             paged = cache.transpose(1, 2)
             key_cache, value_cache = paged.split(64, dim=-1)
-            output = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+            output = (
+                torch.empty(q.shape, dtype=output_dtype, device=q.device)
+                if out is None
+                else out
+            )
             kwargs = {}
             if fp8:
                 attention, version = _load_fp8_paged_attention()
                 descale_shape = (len(metadata.seq_lens), q.shape[1])
                 kwargs = dict(
-                    q_descale=self.q_scale.expand(descale_shape),
-                    k_descale=self.k_scale.expand(descale_shape),
-                    v_descale=self.v_scale.expand(descale_shape),
+                    q_descale=self.q_scale.float().expand(descale_shape),
+                    k_descale=self.k_scale.float().expand(descale_shape),
+                    v_descale=self.v_scale.float().expand(descale_shape),
                 )
             else:
                 attention, version = _load_paged_fa2(), 2

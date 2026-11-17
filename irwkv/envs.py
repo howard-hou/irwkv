@@ -175,9 +175,6 @@ if TYPE_CHECKING:
     IRWKV_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     IRWKV_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     IRWKV_RWKV_TUNING_MODE: Literal["inspect", "require", "tune"] = "tune"
-    IRWKV_RWKV_HYBRID_RECURRENT_BACKEND: Literal["flashrwkv2", "albatross"] = (
-        "flashrwkv2"
-    )
     IRWKV_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     IRWKV_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     IRWKV_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1515,12 +1512,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit RWKV preparation policy; production capture can require coverage.
     "IRWKV_RWKV_TUNING_MODE": env_with_choices(
         "IRWKV_RWKV_TUNING_MODE", "tune", ["inspect", "require", "tune"]
-    ),
-    # Use Albatross for uniform hybrid decode; prefill retains FlashRWKV2.
-    "IRWKV_RWKV_HYBRID_RECURRENT_BACKEND": env_with_choices(
-        "IRWKV_RWKV_HYBRID_RECURRENT_BACKEND",
-        "flashrwkv2",
-        ["flashrwkv2", "albatross"],
     ),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the

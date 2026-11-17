@@ -196,11 +196,15 @@ def test_full_model_online_fp8_matches_independent_bux_emulation():
     actual = run_reference(quantized, tokens, {}, 0)
     torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
-    state = {}
-    chunks = []
+    state, emulated_state = {}, {}
+    chunks, emulated_chunks = [], []
     for start, end in ((0, 5), (5, 11), (11, 18), (18, 19)):
-        chunks.append(run_reference(quantized, tokens[start:end], state, start))
-    torch.testing.assert_close(torch.cat(chunks), expected, atol=2e-5, rtol=2e-5)
+        chunk = tokens[start:end]
+        chunks.append(run_reference(quantized, chunk, state, start))
+        emulated_chunks.append(run_reference(emulated, chunk, emulated_state, start))
+    torch.testing.assert_close(
+        torch.cat(chunks), torch.cat(emulated_chunks), atol=2e-5, rtol=2e-5
+    )
 
 
 def run_reference(model, tokens, state, offset):
@@ -471,6 +475,7 @@ def test_fp8_paged_attention_prefill_decode_and_descale(monkeypatch):
             assert kwargs["fa_version"] == version
         assert kwargs["out"].dtype == torch.bfloat16
         for name in ("q_descale", "k_descale", "v_descale"):
+            assert kwargs[name].dtype == torch.float32
             torch.testing.assert_close(
                 kwargs[name], torch.ones(1, 1, device="cuda"), atol=0, rtol=0
             )
@@ -749,10 +754,9 @@ def test_albatross_decode_fusion_matches_eager():
     reason="Set IRWKV_TEST_FLASH_HYBRID=1 on Linux with RWKV CUDA backends",
 )
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("recurrent_backend", ["flashrwkv2", "albatross"])
 @torch.inference_mode()
-def test_full_hybrid_recurrence_and_paged_attention(batch_size, recurrent_backend):
-    """Exercise real serving storage and recurrent backends through decode."""
+def test_full_hybrid_recurrence_and_paged_attention(batch_size):
+    """Exercise Albatross decode and FlashRWKV2 prefill with serving storage."""
     import flashrwkv2
 
     model = initialized_model("cuda", torch.bfloat16)
@@ -765,7 +769,6 @@ def test_full_hybrid_recurrence_and_paged_attention(batch_size, recurrent_backen
     for index in range(8):
         cache = Rwkv7HybridCacheStorage()
         cache.num_heads = 1
-        cache.use_albatross = recurrent_backend == "albatross"
         if index % 4 != 3:
             cache.kv_cache = torch.zeros(
                 12, 1, 1, 128 + 64 * 64 * 4, dtype=torch.int8, device="cuda"

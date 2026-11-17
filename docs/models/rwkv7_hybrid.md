@@ -1,9 +1,10 @@
 # bux RWKV-7 / RoPE Hybrid
 
 Experimental adapter for [pilot7747/bux](https://github.com/pilot7747/bux/tree/03d5031fcc842ae4a4992921356af31b1bceaee0).
-The FlashRWKV2 and optional Albatross recurrent paths, paged attention,
-full-decode CUDA Graphs and engine generation have been exercised on Colab A100.
-Inductor compilation remains disabled.
+The Albatross decode path, FlashRWKV2 prefill, paged attention, full-decode CUDA
+Graphs and engine generation have been exercised on Colab A100. The default is
+Albatross decode with eager prefill plus full-decode CUDA Graphs. An experimental
+FlashRWKV2 Inductor path with full/piecewise graphs has also been exercised on SM120.
 
 ## Architecture
 
@@ -60,16 +61,16 @@ not a substitute for GPU kernel validation. Distributed execution, cache
 transfer and offload are rejected. Recurrent-state gathering and eager prefill
 dispatch still introduce overhead.
 
-`IRWKV_RWKV_HYBRID_RECURRENT_BACKEND=flashrwkv2` is the default. Setting it to
-`albatross` replaces only uniform one-token-per-request decode with the CUDA
-kernel derived from BlinkDL/Albatross; variable-length prefill continues to use
+The default eager path always uses the CUDA kernel derived from BlinkDL/Albatross
+for uniform one-token-per-request decode; there is no FlashRWKV2 decode fallback
+or backend environment switch. Variable-length prefill continues to use
 FlashRWKV2 without padding. The derived kernel accepts BF16 inputs and updates
 FP32 state pages in place through `state_indices` on the current CUDA stream.
 The decode-only kk-pre and post kernels additionally fuse the small normalization,
 scaling, residual and gating operations while retaining eager BF16 intermediate
-rounding. Albatross pages retain its native `[K,V]` state layout, while
-FlashRWKV2 pages use `[V,K]`, so decode needs no layout conversion. Select the
-backend before engine startup and build the `rwkv7_albatross_ops` extension.
+rounding. Albatross pages retain their native `[K,V]` state layout, while
+FlashRWKV2 prefill uses `[V,K]`, so decode needs no layout conversion. Build the
+`rwkv7_albatross_ops` extension before engine startup.
 
 CUDA defaults to `CompilationMode.NONE` with full-decode CUDA Graphs. The engine
 reports this as `FULL_DECODE_ONLY`; prefill remains eager. Paged attention uses
@@ -77,7 +78,14 @@ live GPU sequence lengths and block tables during replay. FlashRWKV2 metadata
 tickets and recurrent slot tensors are prepared outside capture, retained for graph reuse and
 shared by all recurrent layers in a batch. Albatross decode does not prepare
 FlashRWKV2 metadata tickets. `enforce_eager=True` remains available for debugging.
-No Inductor or `torch.compile` result is claimed.
+
+The experimental Inductor path uses `CompilationMode.VLLM_COMPILE` and
+`FULL_AND_PIECEWISE` graphs. Custom-op boundaries keep token shift/state updates,
+recurrence and paged attention outside the compiled pure-tensor regions. Explicitly
+selecting Inductor uses FlashRWKV2 recurrence and does not include the fused
+Albatross decode implementation; the default eager path never falls back to it.
+SM120 full-model generation, graph capture and throughput results are recorded
+in `rwkv7_hybrid_b300_fp8_2026-11-17.md`.
 
 Native irwkv parameter names are accepted. A bux checkpoint-name conversion is
 not supplied. Dummy weights support timing, not meaningful generated text or
@@ -95,8 +103,8 @@ IRWKV_TEST_FLASH_HYBRID=1 .venv/bin/python -m pytest --noconftest \
 ```
 
 The explicit GPU tests fail if a required CUDA backend is missing. They compare
-a complete eight-layer BF16 model using FlashRWKV2 and Albatross, with one and
-two requests, against the reference through prefill and decode. FP8-specific
+a complete eight-layer BF16 model using FlashRWKV2 prefill and Albatross decode,
+with one and two requests, against the reference through prefill and decode. FP8-specific
 cases cover scaled GEMM on SM89+, fused RoPE/cache writes, paged FA3/FA4/Triton
 prefill and decode on SM90/SM100/SM120, descale arguments and engine cache-spec
 propagation.
@@ -244,8 +252,8 @@ identical BF16 precision, paged FA2, full-decode graphs and workload defaults:
 | Median first-turn TTFT | 3.229 s | 3.227 s |
 | Prefix cache hit | 72.09% | 72.09% |
 
-The 0.05 ms median TPOT difference is negligible in these single runs. The
-Albatross backend therefore remains optional; FlashRWKV2 is still the default.
+The 0.05 ms median TPOT difference is negligible in these single runs. At the
+time of this historical A/B, Albatross was optional and FlashRWKV2 was the default.
 This A/B does not claim that the remaining gap to the author's 22.20 ms can be
 closed by replacing the recurrent kernel alone.
 
