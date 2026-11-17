@@ -21,6 +21,20 @@ void rwkv7_albatross_decode_cuda(
     torch::Tensor b,
     torch::Tensor y);
 
+void rwkv7_albatross_prefill_cuda(
+    int64_t B,
+    int64_t H,
+    torch::Tensor state,
+    torch::Tensor state_indices,
+    torch::Tensor cu_seqlens,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 rwkv7_albatross_kk_pre_decode_cuda(
     torch::Tensor k,
@@ -123,6 +137,61 @@ void forward_decode(
       "r,w,k,v,a,b,y shape mismatch");
   rwkv7_albatross_decode_cuda(
       B, H * 64, H, state, state_indices, r, w, k, v, a, b, y);
+}
+
+void forward_prefill(
+    torch::Tensor state,
+    torch::Tensor state_indices,
+    torch::Tensor cu_seqlens,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y) {
+  TORCH_CHECK(state.is_cuda(), "state must be CUDA");
+  TORCH_CHECK(state.scalar_type() == torch::kFloat32, "state must be FP32");
+  TORCH_CHECK(
+      state.dim() == 4 && state.size(2) == 64 && state.size(3) == 64,
+      "state must have shape [P,H,64,64]");
+  TORCH_CHECK(
+      state.stride(3) == 1 && state.stride(2) == 64 &&
+          state.stride(1) == 64 * 64 &&
+          state.stride(0) >= state.size(1) * 64 * 64,
+      "state must have contiguous [H,64,64] pages");
+  const int64_t H = state.size(1);
+  TORCH_CHECK(H > 0 && H <= 65535, "head count must be in [1,65535]");
+  TORCH_CHECK(
+      state_indices.is_cuda() && state_indices.is_contiguous() &&
+          state_indices.scalar_type() == torch::kInt64 &&
+          state_indices.dim() == 1,
+      "state_indices must be contiguous CUDA int64 with shape [B]");
+  const int64_t B = state_indices.size(0);
+  TORCH_CHECK(B > 0 && B <= 65535, "prefill batch must be in [1,65535]");
+  TORCH_CHECK(
+      cu_seqlens.is_cuda() && cu_seqlens.is_contiguous() &&
+          (cu_seqlens.scalar_type() == torch::kInt32 ||
+           cu_seqlens.scalar_type() == torch::kInt64) &&
+          cu_seqlens.dim() == 1 && cu_seqlens.size(0) == B + 1,
+      "cu_seqlens must be contiguous CUDA int32/int64 with shape [B+1]");
+  check_bf16_cuda_contiguous(r, "r");
+  TORCH_CHECK(
+      r.dim() == 3 && r.size(1) == H && r.size(2) == 64,
+      "inputs must have shape [T,H,64]");
+  check_bf16_cuda_contiguous(w, "w");
+  check_bf16_cuda_contiguous(k, "k");
+  check_bf16_cuda_contiguous(v, "v");
+  check_bf16_cuda_contiguous(a, "a");
+  check_bf16_cuda_contiguous(b, "b");
+  check_bf16_cuda_contiguous(y, "y");
+  TORCH_CHECK(
+      r.sizes() == w.sizes() && r.sizes() == k.sizes() &&
+          r.sizes() == v.sizes() && r.sizes() == a.sizes() &&
+          r.sizes() == b.sizes() && r.sizes() == y.sizes(),
+      "r,w,k,v,a,b,y shape mismatch");
+  rwkv7_albatross_prefill_cuda(
+      B, H, state, state_indices, cu_seqlens, r, w, k, v, a, b, y);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> kk_pre_decode(
@@ -261,6 +330,10 @@ TORCH_LIBRARY(irwkv7_albatross, m) {
       "forward_decode(Tensor(a!) state, Tensor state_indices, Tensor r, "
       "Tensor w, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(b!) y) -> ()");
   m.def(
+      "forward_prefill(Tensor(a!) state, Tensor state_indices, "
+      "Tensor cu_seqlens, Tensor r, Tensor w, Tensor k, Tensor v, Tensor a, "
+      "Tensor b, Tensor(b!) y) -> ()");
+  m.def(
       "kk_pre_decode(Tensor k, Tensor k_k, Tensor a, Tensor k_a) "
       "-> (Tensor, Tensor, Tensor)");
   m.def(
@@ -279,6 +352,7 @@ TORCH_LIBRARY(irwkv7_albatross, m) {
 
 TORCH_LIBRARY_IMPL(irwkv7_albatross, CUDA, m) {
   m.impl("forward_decode", &forward_decode);
+  m.impl("forward_prefill", &forward_prefill);
   m.impl("kk_pre_decode", &kk_pre_decode);
   m.impl("post_decode", &post_decode);
   m.impl("layer_norm", &layer_norm);

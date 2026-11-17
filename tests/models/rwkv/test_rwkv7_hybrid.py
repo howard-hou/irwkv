@@ -633,6 +633,49 @@ def test_engine_config_preserves_hybrid_geometry_and_cache_mode(
         torch.testing.assert_close(scale, torch.ones(1), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("backend", ["albatross", "flashrwkv2"])
+def test_inductor_recurrent_backend_dispatch(monkeypatch, backend):
+    pytest.importorskip("openai_harmony")
+    adapter = importlib.import_module("irwkv.model_executor.models.rwkv7_hybrid")
+    monkeypatch.setenv("IRWKV_RWKV_HYBRID_RECURRENT_BACKEND", backend)
+    inputs = [torch.randn(2, 1, 64) for _ in range(6)]
+    state = torch.randn(5, 1, 64, 64)
+    indices = torch.tensor([3, 1])
+    output = torch.empty_like(inputs[0])
+    metadata = SimpleNamespace(
+        state_indices=indices,
+        max_query_len=1,
+        validated_metadata=object(),
+        recurrent_slots=torch.arange(2, dtype=torch.int32),
+        max_recurrent_seq_len=1,
+        cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(state_views=lambda: (None, state))
+    monkeypatch.setattr(adapter, "_layer_and_metadata", lambda _: (layer, metadata))
+    calls = []
+
+    def albatross_decode(_state, _indices, *_args):
+        calls.append("albatross")
+        _args[-1].fill_(1)
+
+    def flash_decode(*args, **_kwargs):
+        calls.append("flashrwkv2")
+        return torch.ones_like(args[0])
+
+    flash = SimpleNamespace(
+        prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor=lambda value: value,
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen=flash_decode,
+    )
+    albatross = SimpleNamespace(forward_decode=albatross_decode)
+    monkeypatch.setattr(adapter, "_load_albatross", lambda: albatross)
+    monkeypatch.setattr(adapter, "_load_flashrwkv2", lambda: flash)
+
+    adapter.rwkv7_hybrid_recur(*inputs, output, "model.layers.0.cache")
+
+    assert calls == [backend]
+    torch.testing.assert_close(output, torch.ones_like(output))
+
+
 @pytest.mark.skipif(
     os.environ.get("IRWKV_TEST_FLASH_HYBRID") != "1",
     reason="Set IRWKV_TEST_FLASH_HYBRID=1 on Linux with RWKV CUDA backends",
@@ -723,6 +766,90 @@ def test_attention_prepare_decode_matches_strided_eager_views_and_pages(cache_dt
     reason="Set IRWKV_TEST_FLASH_HYBRID=1 on Linux with RWKV CUDA backends",
 )
 @torch.inference_mode()
+def test_albatross_prefill_matches_reference_varlen_and_preserves_pages():
+    from irwkv import rwkv7_albatross_ops  # noqa: F401
+
+    torch.manual_seed(72)
+    heads, lengths = 2, (3, 19)
+    total = sum(lengths)
+    indices = torch.tensor([5, 2], device="cuda", dtype=torch.int64)
+    cu_seqlens = torch.tensor([0, lengths[0], total], device="cuda", dtype=torch.int32)
+    state = 0.05 * torch.randn(7, heads, 64, 64, device="cuda")
+    initial = state.clone()
+    inputs = [
+        0.2 * torch.randn(total, heads, 64, device="cuda", dtype=torch.bfloat16)
+        for _ in range(6)
+    ]
+    expected_output = torch.empty_like(inputs[0])
+    expected_state = initial.clone()
+    for sequence, (begin, end) in enumerate(
+        zip(cu_seqlens[:-1].cpu(), cu_seqlens[1:].cpu())
+    ):
+        reference_initial = initial[indices[sequence]].transpose(-1, -2)
+        output, final_state = reference_recurrence(
+            *(value[begin:end] for value in inputs), reference_initial
+        )
+        expected_output[begin:end] = output
+        expected_state[indices[sequence]] = final_state.transpose(-1, -2)
+
+    actual_output = torch.empty_like(inputs[0])
+    torch.ops.irwkv7_albatross.forward_prefill(
+        state, indices, cu_seqlens, *inputs, actual_output
+    )
+    torch.testing.assert_close(actual_output, expected_output, atol=0.002, rtol=0.02)
+    torch.testing.assert_close(state, expected_state, atol=0.002, rtol=0.02)
+    untouched = torch.ones(7, dtype=torch.bool, device="cuda")
+    untouched[indices] = False
+    torch.testing.assert_close(state[untouched], initial[untouched], atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    os.environ.get("IRWKV_TEST_FLASH_HYBRID") != "1",
+    reason="Set IRWKV_TEST_FLASH_HYBRID=1 on Linux with RWKV CUDA backends",
+)
+@torch.inference_mode()
+def test_albatross_prefill_cuda_graph_replay():
+    from irwkv import rwkv7_albatross_ops  # noqa: F401
+
+    torch.manual_seed(73)
+    state = 0.05 * torch.randn(3, 1, 64, 64, device="cuda")
+    initial = state.clone()
+    indices = torch.tensor([1], device="cuda", dtype=torch.int64)
+    cu_seqlens = torch.tensor([0, 17], device="cuda", dtype=torch.int32)
+    inputs = [
+        0.2 * torch.randn(17, 1, 64, device="cuda", dtype=torch.bfloat16)
+        for _ in range(6)
+    ]
+    reference_initial = initial[1].transpose(-1, -2)
+    expected_output, reference_final = reference_recurrence(*inputs, reference_initial)
+    expected_state = reference_final.transpose(-1, -2)
+    output = torch.empty_like(inputs[0])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        torch.ops.irwkv7_albatross.forward_prefill(
+            state, indices, cu_seqlens, *inputs, output
+        )
+    torch.cuda.current_stream().wait_stream(stream)
+    state.copy_(initial)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.irwkv7_albatross.forward_prefill(
+            state, indices, cu_seqlens, *inputs, output
+        )
+    for _ in range(5):
+        state.copy_(initial)
+        output.zero_()
+        graph.replay()
+        torch.testing.assert_close(output, expected_output, atol=0.002, rtol=0.02)
+        torch.testing.assert_close(state[1], expected_state, atol=0.002, rtol=0.02)
+
+
+@pytest.mark.skipif(
+    os.environ.get("IRWKV_TEST_FLASH_HYBRID") != "1",
+    reason="Set IRWKV_TEST_FLASH_HYBRID=1 on Linux with RWKV CUDA backends",
+)
+@torch.inference_mode()
 def test_albatross_decode_fusion_matches_eager():
     model = initialized_model("cuda", torch.bfloat16)
     mixer = model.layers[0].mixer
@@ -756,9 +883,7 @@ def test_albatross_decode_fusion_matches_eager():
 @pytest.mark.parametrize("batch_size", [1, 2])
 @torch.inference_mode()
 def test_full_hybrid_recurrence_and_paged_attention(batch_size):
-    """Exercise Albatross decode and FlashRWKV2 prefill with serving storage."""
-    import flashrwkv2
-
+    """Exercise pure CUDA varlen prefill and decode with serving storage."""
     model = initialized_model("cuda", torch.bfloat16)
     bounds = [(0, 5, 11, 18, 19), (0, 4, 9, 16, 17)][:batch_size]
     tokens = [
@@ -809,7 +934,7 @@ def test_full_hybrid_recurrence_and_paged_attention(batch_size):
         def run(index, mixer, x, metadata=metadata, positions=positions):
             cache = caches[index]
             if index % 4 != 3:
-                return cache.run_recurrent(mixer, x, metadata, flashrwkv2)
+                return cache.run_recurrent(mixer, x, metadata)
             return mixer(
                 x,
                 positions,

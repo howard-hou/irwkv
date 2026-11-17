@@ -1,6 +1,6 @@
 <div align="center">
   
-# infer-rwkv
+# irwkv-hybrid
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11–3.14-blue)](pyproject.toml)
@@ -10,7 +10,7 @@
 
 </div>
 
-irwkv is a CUDA inference and serving framework built for RWKV-7. It brings
+irwkv-hybrid is a CUDA inference and serving framework built for RWKV-7. It brings
 continuous batching, recurrent-state management, and OpenAI-compatible APIs to
 the fused operators in [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2).
 

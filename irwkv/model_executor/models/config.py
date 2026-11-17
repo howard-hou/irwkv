@@ -296,10 +296,18 @@ class Rwkv7HybridForCausalLMConfig(VerifyAndUpdateConfig):
                 if max_capture not in capture_sizes:
                     capture_sizes.append(max_capture)
                 compilation_config.cudagraph_capture_sizes = capture_sizes
+        from irwkv import envs
+
+        recurrent_backend = (
+            envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND
+            if compilation_config.mode != CompilationMode.NONE
+            else "albatross"
+        )
         logger.info(
-            "bux hybrid uses paged %s attention and FlashRWKV2 with FP32 state; "
+            "bux hybrid uses paged %s attention and %s with FP32 state; "
             "CUDA graph mode: %s",
             "FA3/FA4/Triton FP8" if cache.cache_dtype == "fp8" else "FA2 BF16",
+            recurrent_backend,
             compilation_config.cudagraph_mode,
         )
 
