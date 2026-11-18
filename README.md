@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD041 -->
 <div align="center">
   
 # irwkv-hybrid
@@ -6,7 +7,7 @@
 [![Python](https://img.shields.io/badge/python-3.11–3.14-blue)](pyproject.toml)
 [![CUDA](https://img.shields.io/badge/backend-CUDA-76B900)](docs/models/rwkv.md)
 
-[Quick start](#quick-start) · [Offline inference](#offline-inference) · [Serving](#serving) · [Documentation](#documentation)
+[Quick start](#quick-start) · [FP8 results](#fp8-hybrid-serving) · [Offline inference](#offline-inference) · [Serving](#serving) · [Documentation](#documentation)
 
 </div>
 
@@ -20,10 +21,33 @@ the fused operators in [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2).
   management and chunked prefill.
 - **GPU execution** — FlashRWKV2 fused operators, CUDA Graph capture, and
   asynchronous scheduling and detokenization.
+- **Hybrid FP8 serving** — Albatross recurrent execution, Inductor compilation,
+  Cutlass FP8 GEMM, and FP8 KV cache for RWKV-7/attention hybrids.
 - **Familiar APIs** — Python inference, streaming Completions, Chat Completions,
   and Responses, with structured outputs and tool calling.
 - **Deployment options** — single-GPU inference, two-stage pipeline parallelism,
   and an optional Rust frontend.
+
+## FP8 hybrid serving
+
+On an NVIDIA B300, the RWKV-7 hybrid with three RWKV-7 layers per attention layer
+reaches an interpolated **35.17B active parameters at 1,924 sessions/h**, under
+a p50 TPOT SLO of 30 ms. The corresponding bux RWKV-7 reference supports 7.97B
+active parameters under the same agentic workload and serving-cost target.
+
+![B300 FP8 serving comparison: irwkv reaches 35.17B active parameters at 1,924 sessions per hour](docs/models/rwkv7_hybrid_serving_comparison_2026-11-17.png)
+
+Replacing only the RWKV-7 serving target in the bux scaling-law fit predicts a
+**4.99% loss reduction** at 1T tokens relative to the 2021 parent at equal
+serving cost, with a 5th–95th percentile bootstrap range of **3.93%–6.14%**.
+The range comes from 100 bootstrap refits; the other architecture results remain
+unchanged.
+
+![Predicted loss change at 1T tokens: irwkv is 4.99% below the parent, with a bootstrap range of 3.93% to 6.14%](docs/models/rwkv7_hybrid_predicted_1t_2026-11-17.png)
+
+These are dummy-weight throughput measurements and scaling-law extrapolations,
+not measured model quality. See the [full methodology, raw results, and bootstrap
+validation](docs/models/rwkv7_hybrid_b300_fp8_2026-11-17.md).
 
 ## Quick start
 
