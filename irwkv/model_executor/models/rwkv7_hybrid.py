@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """bux timeline hybrid served by irwkv with scheduler-owned KV and RWKV state."""
 
 import torch
 from torch import nn
 
+from irwkv import envs
 from irwkv.compilation.decorators import support_torch_compile
 from irwkv.config.compilation import CompilationMode
 from irwkv.forward_context import get_forward_context
@@ -14,6 +16,7 @@ from irwkv.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from irwkv.models.rwkv7_hybrid import (
     Rwkv7HybridCacheStorage,
     Rwkv7HybridModel,
+    _load_albatross,
     _register_albatross_fakes,
 )
 from irwkv.utils.torch_utils import direct_register_custom_op
@@ -59,23 +62,40 @@ def rwkv7_hybrid_recur(
     layer, metadata = _layer_and_metadata(layer_name)
     indices = metadata.state_indices
     _, state_pool = layer.state_views()
-    state = state_pool.index_select(0, indices).contiguous()
-    flash = _load_flashrwkv2()
-    handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
-    if getattr(metadata, "validated_metadata", None) is None:
-        layer.prepare_recurrent_metadata(metadata, flash)
     tensors = tuple(tensor.contiguous() for tensor in (r, decay, k, v, a, b))
-    out.copy_(
-        flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-            *tensors,
-            state=handle,
-            cu_seqlens=metadata.cu_seqlens,
-            state_indices=metadata.recurrent_slots,
-            max_seqlen=metadata.max_recurrent_seq_len,
-            validated_metadata=metadata.validated_metadata,
-        )
+    backend = envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND
+    use_flash = backend == "flashrwkv2" or (
+        backend == "mixed" and metadata.max_query_len != 1
     )
-    state_pool[indices] = state
+    if use_flash:
+        state = state_pool.index_select(0, indices)
+        if backend == "mixed":
+            # Scheduler pages stay in Albatross [K,V] layout for decode/snapshots.
+            state = state.transpose(-1, -2)
+        state = state.contiguous()
+        flash = _load_flashrwkv2()
+        handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
+        if metadata.validated_metadata is None:
+            layer.prepare_recurrent_metadata(metadata, flash)
+        out.copy_(
+            flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+                *tensors,
+                state=handle,
+                cu_seqlens=metadata.cu_seqlens,
+                state_indices=metadata.recurrent_slots,
+                max_seqlen=metadata.max_recurrent_seq_len,
+                validated_metadata=metadata.validated_metadata,
+            )
+        )
+        if backend == "mixed":
+            state = state.transpose(-1, -2)
+        state_pool[indices] = state
+        return
+    ops = _load_albatross()
+    if metadata.max_query_len == 1:
+        ops.forward_decode(state_pool, indices, *tensors, out)
+    else:
+        ops.forward_prefill(state_pool, indices, metadata.cu_seqlens, *tensors, out)
 
 
 def rwkv7_hybrid_attention(
@@ -145,7 +165,12 @@ class Rwkv7HybridCache(nn.Module, Rwkv7HybridCacheStorage, AttentionLayerBase):
         )
 
     def prepare_metadata_ticket(self, metadata, *, retain_ticket=False):
-        if not self.use_compiled_ops and metadata.max_query_len == 1:
+        if not self.use_compiled_ops:
+            return None
+        backend = envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND
+        if backend == "albatross" or (
+            backend == "mixed" and metadata.max_query_len == 1
+        ):
             return None
         return self.prepare_recurrent_metadata(
             metadata, _load_flashrwkv2(), retain_ticket=retain_ticket
@@ -265,7 +290,7 @@ class Rwkv7HybridForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 return cache.run_attention_compiled(mixer, x, positions)
             batch = metadata[cache.prefix]
             if cache.recurrent:
-                return cache.run_recurrent(mixer, x, batch, _load_flashrwkv2())
+                return cache.run_recurrent(mixer, x, batch)
             return mixer(
                 x,
                 positions,

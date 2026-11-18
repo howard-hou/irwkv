@@ -14,7 +14,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "irwkv"
+name = "irwkv-hybrid"
 authors = [{name = "irwkv Team"}]
 license = "Apache-2.0"
 license-files = ["LICENSE"]

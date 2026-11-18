@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import torch
 
+from irwkv import envs
+from irwkv.config.compilation import CompilationMode
 from irwkv.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -42,13 +44,16 @@ class Rwkv7HybridMetadataBuilder(AttentionMetadataBuilder[Rwkv7HybridMetadata]):
     def __init__(self, kv_cache_spec, layer_names, irwkv_config, device):
         super().__init__(kv_cache_spec, layer_names, irwkv_config, device)
         self._state_layer = None
-        if isinstance(kv_cache_spec, MambaSpec):
-            self._state_layer = irwkv_config.compilation_config.static_forward_context[
-                layer_names[0]
-            ]
-        self._live_state_indices = {}
+        compilation = irwkv_config.compilation_config
+        if (
+            isinstance(kv_cache_spec, MambaSpec)
+            and compilation.mode != CompilationMode.NONE
+            and envs.IRWKV_RWKV_HYBRID_RECURRENT_BACKEND == "flashrwkv2"
+        ):
+            self._state_layer = compilation.static_forward_context[layer_names[0]]
         self._captured_descriptors = set()
-        cudagraph_mode = irwkv_config.compilation_config.cudagraph_mode
+        self._live_state_indices = {}
+        cudagraph_mode = compilation.cudagraph_mode
         self._use_live_metadata = bool(
             cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
         )

@@ -124,6 +124,93 @@ __global__ __launch_bounds__(kWarpThreads, 4) void wkv_decode_kernel(
   }
 }
 
+constexpr int kPrefillChunk = 16;
+
+// Inference-only varlen prefill derived from BlinkDL's chunked forward kernel.
+// Each block owns one sequence/head and keeps [K,V] state in registers.
+template <typename SeqT>
+__global__ __launch_bounds__(kHeadSize, 2) void wkv_prefill_kernel(
+    int H,
+    int64_t state_pool_stride,
+    float* __restrict__ state_ptr,
+    const int64_t* __restrict__ state_indices_ptr,
+    const SeqT* __restrict__ cu_seqlens_ptr,
+    const __nv_bfloat16* __restrict__ r_ptr,
+    const __nv_bfloat16* __restrict__ w_ptr,
+    const __nv_bfloat16* __restrict__ k_ptr,
+    const __nv_bfloat16* __restrict__ v_ptr,
+    const __nv_bfloat16* __restrict__ a_ptr,
+    const __nv_bfloat16* __restrict__ b_ptr,
+    __nv_bfloat16* __restrict__ y_ptr) {
+  const int head = static_cast<int>(blockIdx.x);
+  const int sequence = static_cast<int>(blockIdx.y);
+  const int value_index = static_cast<int>(threadIdx.x);
+  const int64_t begin = static_cast<int64_t>(cu_seqlens_ptr[sequence]);
+  const int64_t end = static_cast<int64_t>(cu_seqlens_ptr[sequence + 1]);
+  const int64_t state_slot = __ldg(state_indices_ptr + sequence);
+  float* state_base = state_ptr + state_slot * state_pool_stride +
+      static_cast<int64_t>(head) * kHeadSize * kHeadSize;
+
+  float state[kHeadSize];
+#pragma unroll
+  for (int key = 0; key < kHeadSize; ++key) {
+    state[key] = state_base[key * kHeadSize + value_index];
+  }
+
+  __shared__ float r_shared[kPrefillChunk][kHeadSize];
+  __shared__ float w_shared[kPrefillChunk][kHeadSize];
+  __shared__ float k_shared[kPrefillChunk][kHeadSize];
+  __shared__ float v_shared[kPrefillChunk][kHeadSize];
+  __shared__ float a_shared[kPrefillChunk][kHeadSize];
+  __shared__ float b_shared[kPrefillChunk][kHeadSize];
+
+  for (int64_t chunk = begin; chunk < end; chunk += kPrefillChunk) {
+    const int tokens = static_cast<int>(end - chunk) < kPrefillChunk
+        ? static_cast<int>(end - chunk)
+        : kPrefillChunk;
+    __syncthreads();
+#pragma unroll
+    for (int offset = 0; offset < kPrefillChunk; ++offset) {
+      if (offset < tokens) {
+        const int64_t index =
+            ((chunk + offset) * H + head) * kHeadSize + value_index;
+        r_shared[offset][value_index] = load_bf16(r_ptr, index);
+        w_shared[offset][value_index] = retention(load_bf16(w_ptr, index));
+        k_shared[offset][value_index] = load_bf16(k_ptr, index);
+        v_shared[offset][value_index] = load_bf16(v_ptr, index);
+        a_shared[offset][value_index] = load_bf16(a_ptr, index);
+        b_shared[offset][value_index] = load_bf16(b_ptr, index);
+      }
+    }
+    __syncthreads();
+
+    for (int offset = 0; offset < tokens; ++offset) {
+      float a_state = 0.0f;
+#pragma unroll
+      for (int key = 0; key < kHeadSize; ++key) {
+        a_state += state[key] * a_shared[offset][key];
+      }
+      const float value = v_shared[offset][value_index];
+      float result = 0.0f;
+#pragma unroll
+      for (int key = 0; key < kHeadSize; ++key) {
+        const float updated = state[key] * w_shared[offset][key] +
+            a_state * b_shared[offset][key] + k_shared[offset][key] * value;
+        state[key] = updated;
+        result += updated * r_shared[offset][key];
+      }
+      const int64_t index =
+          ((chunk + offset) * H + head) * kHeadSize + value_index;
+      y_ptr[index] = to_bf16(result);
+    }
+  }
+
+#pragma unroll
+  for (int key = 0; key < kHeadSize; ++key) {
+    state_base[key * kHeadSize + value_index] = state[key];
+  }
+}
+
 // Fuse a=sigmoid(a), k scaling, kk normalization, -kk and kk*a.
 // Intermediate BF16 rounding intentionally matches the eager serving path.
 __global__ __launch_bounds__(kWarpsPerBlock * kWarpThreads) void
@@ -449,6 +536,44 @@ void rwkv7_albatross_decode_cuda(
       reinterpret_cast<const __nv_bfloat16*>(a.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(b.data_ptr<at::BFloat16>()),
       reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void rwkv7_albatross_prefill_cuda(
+    int64_t B,
+    int64_t H,
+    torch::Tensor state,
+    torch::Tensor state_indices,
+    torch::Tensor cu_seqlens,
+    torch::Tensor r,
+    torch::Tensor w,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor y) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto launch = [&](auto sequence_marker) {
+    using SeqT = decltype(sequence_marker);
+    wkv_prefill_kernel<SeqT><<<dim3(H, B), kHeadSize, 0, stream>>>(
+        static_cast<int>(H),
+        state.stride(0),
+        state.data_ptr<float>(),
+        state_indices.data_ptr<int64_t>(),
+        cu_seqlens.data_ptr<SeqT>(),
+        reinterpret_cast<const __nv_bfloat16*>(r.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(w.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(a.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(b.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()));
+  };
+  if (cu_seqlens.scalar_type() == torch::kInt32) {
+    launch(int32_t{});
+  } else {
+    launch(int64_t{});
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

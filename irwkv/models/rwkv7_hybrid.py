@@ -386,7 +386,7 @@ class Rwkv7HybridCacheStorage:
             self._live_graph_tickets.append(ticket)
         return ticket
 
-    def run_recurrent(self, mixer, x, metadata, flash):
+    def run_recurrent(self, mixer, x, metadata):
         indices = metadata.state_indices
         previous_pool, state_pool = self.state_views()
         albatross_decode = metadata.max_query_len == 1
@@ -399,42 +399,23 @@ class Rwkv7HybridCacheStorage:
             previous = torch.roll(x, 1, 0)
             starts = metadata.cu_seqlens[:-1].long()
             previous[starts] = previous_pool[indices]
-        # The scheduler's strided page remains authoritative, including
-        # copy-on-write and prefix snapshots. Keep the selected backend's native
-        # layout in the page: Albatross uses [K,V], FlashRWKV2 uses [V,K].
-        # Albatross updates indexed pool pages directly, without per-step copies.
-        state = None
-        handle = None
-        slots = max_length = ticket = None
-        if not albatross_decode:
-            state = state_pool.index_select(0, indices).contiguous()
-            handle = flash.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
-            if getattr(metadata, "validated_metadata", None) is None:
-                self.prepare_recurrent_metadata(metadata, flash)
-            slots = metadata.recurrent_slots
-            max_length = metadata.max_recurrent_seq_len
-            ticket = metadata.validated_metadata
 
         def recur(r, decay, k, v, a, b):
             tensors = tuple(tensor.contiguous() for tensor in (r, decay, k, v, a, b))
+            output = torch.empty_like(r)
+            ops = _load_albatross()
             if albatross_decode:
-                output = torch.empty_like(r)
-                _load_albatross().forward_decode(state_pool, indices, *tensors, output)
-                return output
-            return flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-                *tensors,
-                state=handle,
-                cu_seqlens=metadata.cu_seqlens,
-                state_indices=slots,
-                max_seqlen=max_length,
-                validated_metadata=ticket,
-            )
+                ops.forward_decode(state_pool, indices, *tensors, output)
+            else:
+                ops.forward_prefill(
+                    state_pool, indices, metadata.cu_seqlens, *tensors, output
+                )
+            return output
 
         output = mixer(
             x, previous, recur, fused_decode=albatross_decode, shifted=shifted
         )
         if not albatross_decode:
-            state_pool[indices] = state
             previous_pool[indices] = x[metadata.cu_seqlens[1:].long() - 1]
         return output
 

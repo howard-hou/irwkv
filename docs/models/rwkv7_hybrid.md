@@ -1,10 +1,10 @@
 # bux RWKV-7 / RoPE Hybrid
 
 Experimental adapter for [pilot7747/bux](https://github.com/pilot7747/bux/tree/03d5031fcc842ae4a4992921356af31b1bceaee0).
-The Albatross decode path, FlashRWKV2 prefill, paged attention, full-decode CUDA
-Graphs and engine generation have been exercised on Colab A100. The default is
-Albatross decode with eager prefill plus full-decode CUDA Graphs. An experimental
-FlashRWKV2 Inductor path with full/piecewise graphs has also been exercised on SM120.
+Both variable-length prefill and uniform decode use Albatross CUDA kernels with
+scheduler-owned FP32 state pages. The default uses full-decode CUDA Graphs;
+the optional Inductor path uses the same CUDA prefill and decode operators.
+Earlier FlashRWKV2 measurements below are retained only as historical records.
 
 ## Architecture
 
@@ -38,10 +38,12 @@ tensors and BF16 output. The SM120 path uses the 2D kernel for prefill and the
 3D split-softmax kernel for eligible decode batches, including vLLM's SM120
 segment-count selection. BF16 attention continues to use paged FA2. Each
 recurrent layer has a scheduler-owned page containing BF16 token shift and FP32
-recurrent state; these states are not FP8 quantized. The adapter gathers
-contiguous state for the selected recurrent backend and writes it back after
-each batch. Prefix-boundary transitions copy recurrent state; generic block
-copies and resets cover both cache types.
+recurrent state; these states are not FP8 quantized. Albatross prefill and
+decode update the selected state pages in place through `state_indices`, without
+a contiguous-state gather/writeback or layout conversion. The FlashRWKV2
+Inductor comparison path retains its contiguous-state gather/writeback.
+Prefix-boundary transitions copy recurrent state; generic block copies and
+resets cover both cache types.
 
 `--quantization fp8` enables online per-tensor FP8-E4M3 weight quantization and
 dynamic per-token FP8 activation quantization for linear projections. Each fused
@@ -58,34 +60,33 @@ pages directly, without materializing each request's complete KV history. The
 attention block size must be divisible by 16. CPU tensor tests retain explicit
 FP8 dequantization and PyTorch SDPA reference paths; they are numerical tests,
 not a substitute for GPU kernel validation. Distributed execution, cache
-transfer and offload are rejected. Recurrent-state gathering and eager prefill
-dispatch still introduce overhead.
+transfer and offload are rejected.
 
-The default eager path always uses the CUDA kernel derived from BlinkDL/Albatross
-for uniform one-token-per-request decode; there is no FlashRWKV2 decode fallback
-or backend environment switch. Variable-length prefill continues to use
-FlashRWKV2 without padding. The derived kernel accepts BF16 inputs and updates
-FP32 state pages in place through `state_indices` on the current CUDA stream.
-The decode-only kk-pre and post kernels additionally fuse the small normalization,
-scaling, residual and gating operations while retaining eager BF16 intermediate
-rounding. Albatross pages retain their native `[K,V]` state layout, while
-FlashRWKV2 prefill uses `[V,K]`, so decode needs no layout conversion. Build the
-`rwkv7_albatross_ops` extension before engine startup.
+The default eager path uses CUDA kernels derived from BlinkDL/Albatross for both
+variable-length prefill and uniform one-token-per-request decode. It has no
+FlashRWKV2 fallback. The prefill kernel processes 16-token chunks without
+padding and supports arbitrary sequence lengths and tail chunks. Both kernels
+accept BF16 inputs and update FP32 state pages in place through `state_indices`
+on the current CUDA stream. The decode-only kk-pre and post kernels additionally
+fuse the small normalization, scaling, residual and gating operations while
+retaining eager BF16 intermediate rounding. Albatross recurrent paths retain the
+native `[K,V]` state layout. Build the `rwkv7_albatross_ops` extension before
+engine startup.
 
 CUDA defaults to `CompilationMode.NONE` with full-decode CUDA Graphs. The engine
-reports this as `FULL_DECODE_ONLY`; prefill remains eager. Paged attention uses
-live GPU sequence lengths and block tables during replay. FlashRWKV2 metadata
-tickets and recurrent slot tensors are prepared outside capture, retained for graph reuse and
-shared by all recurrent layers in a batch. Albatross decode does not prepare
-FlashRWKV2 metadata tickets. `enforce_eager=True` remains available for debugging.
+reports this as `FULL_DECODE_ONLY`; prefill remains eager. Paged attention and
+recurrent state indices use live GPU metadata during replay. `enforce_eager=True`
+remains available for debugging.
 
 The experimental Inductor path uses `CompilationMode.VLLM_COMPILE` and
 `FULL_AND_PIECEWISE` graphs. Custom-op boundaries keep token shift/state updates,
-recurrence and paged attention outside the compiled pure-tensor regions. Explicitly
-selecting Inductor uses FlashRWKV2 recurrence and does not include the fused
-Albatross decode implementation; the default eager path never falls back to it.
-SM120 full-model generation, graph capture and throughput results are recorded
-in `rwkv7_hybrid_b300_fp8_2026-11-17.md`.
+recurrence and paged attention outside the compiled pure-tensor regions.
+`IRWKV_RWKV_HYBRID_RECURRENT_BACKEND=albatross` is the default and uses the same
+Albatross CUDA prefill and decode operators as the eager path. Set it to
+`flashrwkv2` for an Inductor A/B run; this restores FlashRWKV2's recurrent
+metadata tickets and contiguous-state gather/writeback without changing the
+eager default. Historical SM120 full-model generation, graph capture and
+throughput results are recorded in `rwkv7_hybrid_b300_fp8_2026-11-17.md`.
 
 Native irwkv parameter names are accepted. A bux checkpoint-name conversion is
 not supplied. Dummy weights support timing, not meaningful generated text or
@@ -103,11 +104,12 @@ IRWKV_TEST_FLASH_HYBRID=1 .venv/bin/python -m pytest --noconftest \
 ```
 
 The explicit GPU tests fail if a required CUDA backend is missing. They compare
-a complete eight-layer BF16 model using FlashRWKV2 prefill and Albatross decode,
-with one and two requests, against the reference through prefill and decode. FP8-specific
-cases cover scaled GEMM on SM89+, fused RoPE/cache writes, paged FA3/FA4/Triton
-prefill and decode on SM90/SM100/SM120, descale arguments and engine cache-spec
-propagation.
+a complete eight-layer BF16 model using Albatross CUDA prefill and decode, with
+one and two requests, against the reference through prefill and decode. Separate
+varlen tests cover nonzero initial state, non-contiguous pages, 16-token chunk
+tails, untouched pages and repeated CUDA Graph replay. FP8-specific cases cover
+scaled GEMM on SM89+, fused RoPE/cache writes, paged FA3/FA4/Triton prefill and
+decode on SM90/SM100/SM120, descale arguments and engine cache-spec propagation.
 Default tests cover complete-model chunking/prefix forks, page
 isolation/reset/copy/padding, online FP8 rounding against an independent bux-style
 emulation, fused-QKV scaling, FP8 KV saturation, configuration and parameter

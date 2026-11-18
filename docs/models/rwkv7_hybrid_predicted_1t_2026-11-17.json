@@ -1,0 +1,79 @@
+{
+  "method": "Full bux objective fit; replace only RWKV-7's FP8 serving target, then refit 100 bootstrap replicates with the original noise model and seed 0",
+  "formula": "L(N,D) = E + A * N**(-alpha) + B * D**(-beta)",
+  "D": 1000000000000.0,
+  "E": 0.3204,
+  "B": 115.1,
+  "beta": 0.2999,
+  "parent": {
+    "N": 3696034851.7830844,
+    "A": 10.93,
+    "alpha": 0.2527,
+    "loss_at_1t_from_rounded_coefficients": 0.39116073094266823
+  },
+  "rwkv7": {
+    "A": 7.338,
+    "alpha": 0.2387
+  },
+  "bootstrap": {
+    "replicates": 100,
+    "seed": 0,
+    "percentiles": [
+      5,
+      95
+    ],
+    "converged": 100,
+    "noise": "objective 0.33% own and 0.69% by seed; 415 dof"
+  },
+  "old": {
+    "target_active": 7970691112.963164,
+    "loss_at_1t_from_rounded_coefficients": 0.38116717965052493,
+    "predicted_change_percent": -2.565007497855687,
+    "bootstrap_range_percent": [
+      -3.6217319564929027,
+      -1.4591247738510849
+    ],
+    "predicted_change_percent_from_rounded_coefficients": -2.5548452340958594,
+    "published_predicted_change_percent": -2.57,
+    "published_range_percent": [
+      -3.62,
+      -1.46
+    ]
+  },
+  "new": {
+    "implementation": "irwkv",
+    "target_active": 35167595824.517136,
+    "loss_at_1t_from_rounded_coefficients": 0.37168711622641576,
+    "predicted_change_percent": -4.988535210292433,
+    "bootstrap_range_percent": [
+      -6.142262245202043,
+      -3.9306281961023193
+    ],
+    "predicted_change_percent_from_rounded_coefficients": -4.978417610919816,
+    "additional_reduction_percentage_points_vs_bux": 2.423527712436746
+  },
+  "validation": {
+    "old_rwkv7_percent": [
+      -2.565007497855687,
+      -3.6217319564929027,
+      -1.4591247738510849
+    ],
+    "old_kda_percent": [
+      -4.684443215249701,
+      -5.839171155490227,
+      -4.2772685095013605
+    ],
+    "old_mamba2_percent": [
+      -3.643578981625961,
+      -4.708880299730856,
+      -2.6698393461968863
+    ],
+    "other_architecture_rows_identical_between_old_and_new_runs": true
+  },
+  "caveats": [
+    "Scaling-law extrapolation, not measured quality.",
+    "irwkv serving measurements used dummy weights.",
+    "The bootstrap range is the 5th–95th percentile of 100 refits, not a 95% confidence interval.",
+    "Published coefficients are rounded and are retained only as a cross-check."
+  ]
+}
